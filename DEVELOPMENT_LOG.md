@@ -289,3 +289,37 @@ This live demonstration is separate from the automated Go tests and is not a per
 - Configuration changes require restarting the gateway; there is no distributed authentication or key-rotation service.
 - Direct microservice ports bypass gateway authentication and authorization.
 - TLS and protected secret management are required for exposed deployments.
+
+## 2026-11-25 — Phase 5A Redis-backed distributed rate limiting
+
+**Status:** Implemented and verified with automated Go tests against the local Redis instance. No commit or push was performed.
+
+### Implemented
+
+- Added a rate-limit storage interface and retained the existing in-memory store and public `New`/`Allow` behavior. `memory` remains the default; Redis-backed operation is selected with `INTELLIGATE_RATE_LIMIT_STORE=redis`.
+- Added `github.com/redis/go-redis/v9` v9.7.0, compatible with the project's Go 1.22 module requirement. No other external service or dependency was added.
+- Implemented Redis token-bucket consumption with one atomic Lua script per request. The script uses Redis server `TIME`, initializes a new bucket at burst capacity, refills and consumes atomically, returns a positive rounded-up retry interval when denied, and refreshes the 10-minute idle TTL.
+- Redis token state uses fixed-point microtokens (1,000,000 units per token), rounded to the nearest microtoken. Redis-mode rate and burst values are bounded to 0.000001–1000 tokens to keep Lua integer arithmetic exact. Keys use the `intelligate:ratelimit:v1` namespace and a SHA-256 digest of the canonical client IP; raw IP addresses are not included in Redis key names.
+- Added validated Redis store/address/password/database/failure-mode settings. Defaults are address `localhost:6379`, DB `0`, operation timeout 2 seconds, startup connectivity timeout 2 seconds, and failure mode `closed`. Redis mode fails startup if the bounded connectivity check fails and never falls back to memory.
+- Request-time Redis failures return generic HTTP 503 JSON in `closed` mode. In `open` mode, the gateway logs a generic warning and allows the request; Redis outages are not reported as 429. Request cancellation is passed into Redis operations.
+- Preserved canonical `RemoteAddr` client IP extraction, ignored forwarded-IP headers, the public unrate-limited `GET /health`, and authentication/authorization before rate limiting. Redis-backed limiters do not start the in-memory cleanup loop. The Redis client closes on gateway exit.
+- Added `INTELLIGATE_LISTEN_ADDR` (default `:8080`) so two local gateway processes can bind separate ports for the shared-quota demonstration. No routing, proxy, retry, health, circuit-breaker, or authentication behavior was changed.
+- Updated README, architecture, API, testing, and this development log with storage modes, configuration, failure semantics, Redis setup, the two-instance procedure, fixed-point bounds, and operational limitations.
+
+### Automated verification
+
+- `gofmt` completed for all changed Go files.
+- `go test ./...` from `gateway`: passed for `cmd/gateway`, `internal/auth`, `internal/balancer`, `internal/circuitbreaker`, `internal/health`, `internal/proxy`, `internal/ratelimit`, and `internal/router`.
+- `go test -count=10 ./internal/ratelimit`: passed (10 runs).
+- `go test -count=10 ./cmd/gateway`: passed (10 runs).
+- `git diff --check` from the repository root: passed with no whitespace errors; Git emitted only line-ending normalization warnings.
+- Redis integration tests ran against the available local Redis endpoint and verified a shared 20-token quota across two separate Redis store instances, independent client buckets, atomic concurrent consumption, refill and Retry-After, TTL expiry, cancellation, operation timeout, failure modes, and store closure. Tests use unique namespaces and delete only their own keys; they do not flush the Redis database.
+- Gateway startup tests verified Redis connectivity initialization, clear startup failure when Redis is unavailable, and that Redis mode does not request the memory cleanup loop.
+- The documented manual procedure using two live gateway processes was not run. No throughput benchmark or race-detector result is claimed.
+
+### Configuration and limitations
+
+- `INTELLIGATE_RATE_LIMIT_STORE=memory|redis` selects the backend. Existing `INTELLIGATE_RATE_LIMIT_ENABLED`, `INTELLIGATE_RATE_LIMIT_RATE`, and `INTELLIGATE_RATE_LIMIT_BURST` remain in effect; defaults are enabled, 10 tokens/second, and burst 20.
+- Redis settings are `INTELLIGATE_REDIS_ADDR` (default `localhost:6379`), optional `INTELLIGATE_REDIS_PASSWORD`, `INTELLIGATE_REDIS_DB` (default `0`), and `INTELLIGATE_RATE_LIMIT_REDIS_FAILURE_MODE=closed|open` (default `closed`).
+- Instances share quotas only when they use the same Redis server/database and matching rate/burst settings and observe the same canonical client IP. Forwarded-IP headers remain untrusted by default.
+- The client targets one Redis address and does not configure TLS, Sentinel, or Cluster. Redis availability, persistence, network access control, and transport protection are operational responsibilities. Redis rate limits are per IP, not per API key; distributed authentication and automatic fallback are not implemented. Configuration changes require a gateway restart.

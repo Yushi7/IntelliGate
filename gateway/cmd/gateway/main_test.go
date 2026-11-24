@@ -402,7 +402,17 @@ func TestAuthenticationSettingsFromEnvRejectsInvalidEnabledFlag(t *testing.T) {
 }
 
 func TestRateLimitSettingsFromEnvUsesDefaultsWhenUnset(t *testing.T) {
-	unsetEnvironment(t, rateLimitEnabledEnv, rateLimitRateEnv, rateLimitBurstEnv)
+	unsetEnvironment(
+		t,
+		rateLimitEnabledEnv,
+		rateLimitRateEnv,
+		rateLimitBurstEnv,
+		rateLimitStoreEnv,
+		redisAddrEnv,
+		redisPasswordEnv,
+		redisDBEnv,
+		rateLimitRedisFailureModeEnv,
+	)
 
 	settings, err := rateLimitSettingsFromEnv()
 	if err != nil {
@@ -414,9 +424,38 @@ func TestRateLimitSettingsFromEnvUsesDefaultsWhenUnset(t *testing.T) {
 	if want := ratelimit.DefaultConfig(); settings.Config != want {
 		t.Fatalf("rate-limit config = %+v, want defaults %+v", settings.Config, want)
 	}
+	if settings.StoreName != "memory" {
+		t.Fatalf("rate-limit store = %q, want memory", settings.StoreName)
+	}
+	if settings.Redis.Addr != "localhost:6379" || settings.Redis.DB != 0 {
+		t.Fatalf("Redis settings = %+v, want localhost:6379 and DB 0", settings.Redis)
+	}
+}
+
+func TestListenAddressFromEnvDefaultsAndSupportsLocalInstances(t *testing.T) {
+	unsetEnvironment(t, listenAddrEnv)
+	if address, err := listenAddressFromEnv(); err != nil || address != ":8080" {
+		t.Fatalf("default listen address = %q, err=%v, want :8080", address, err)
+	}
+	t.Setenv(listenAddrEnv, "127.0.0.1:8081")
+	if address, err := listenAddressFromEnv(); err != nil || address != "127.0.0.1:8081" {
+		t.Fatalf("configured listen address = %q, err=%v, want 127.0.0.1:8081", address, err)
+	}
+}
+
+func TestListenAddressFromEnvRejectsMalformedValues(t *testing.T) {
+	for _, value := range []string{"8081", "localhost:0", "localhost:65536", "localhost:+8081", " localhost:8081"} {
+		t.Run(value, func(t *testing.T) {
+			t.Setenv(listenAddrEnv, value)
+			if _, err := listenAddressFromEnv(); err == nil {
+				t.Fatalf("listenAddressFromEnv(%q) error = nil, want validation error", value)
+			}
+		})
+	}
 }
 
 func TestRateLimitSettingsFromEnvAcceptsOverrides(t *testing.T) {
+	unsetEnvironment(t, rateLimitStoreEnv, redisAddrEnv, redisPasswordEnv, redisDBEnv, rateLimitRedisFailureModeEnv)
 	t.Setenv(rateLimitEnabledEnv, "true")
 	t.Setenv(rateLimitRateEnv, "12.5")
 	t.Setenv(rateLimitBurstEnv, "30")
@@ -427,6 +466,25 @@ func TestRateLimitSettingsFromEnvAcceptsOverrides(t *testing.T) {
 	}
 	if !settings.Enabled || settings.Config.Rate != 12.5 || settings.Config.Burst != 30 {
 		t.Fatalf("rate-limit settings = %+v, want enabled with rate 12.5 and burst 30", settings)
+	}
+}
+
+func TestRateLimitSettingsFromEnvAcceptsRedisConfiguration(t *testing.T) {
+	unsetEnvironment(t, rateLimitEnabledEnv, rateLimitStoreEnv, redisAddrEnv, redisPasswordEnv, redisDBEnv, rateLimitRedisFailureModeEnv)
+	t.Setenv(rateLimitStoreEnv, "redis")
+	t.Setenv(redisAddrEnv, "127.0.0.1:6380")
+	t.Setenv(redisPasswordEnv, "local-placeholder")
+	t.Setenv(redisDBEnv, "2")
+	t.Setenv(rateLimitRedisFailureModeEnv, "open")
+
+	settings, err := rateLimitSettingsFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if settings.StoreName != "redis" || settings.Redis.Addr != "127.0.0.1:6380" ||
+		settings.Redis.Password != "local-placeholder" || settings.Redis.DB != 2 ||
+		settings.Config.FailureMode != ratelimit.FailureModeOpen {
+		t.Fatalf("Redis rate-limit settings = %+v", settings)
 	}
 }
 
@@ -450,7 +508,17 @@ func TestRateLimitSettingsFromEnvRejectsInvalidEnabledConfiguration(t *testing.T
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			unsetEnvironment(t, rateLimitEnabledEnv, rateLimitRateEnv, rateLimitBurstEnv)
+			unsetEnvironment(
+				t,
+				rateLimitEnabledEnv,
+				rateLimitRateEnv,
+				rateLimitBurstEnv,
+				rateLimitStoreEnv,
+				redisAddrEnv,
+				redisPasswordEnv,
+				redisDBEnv,
+				rateLimitRedisFailureModeEnv,
+			)
 			t.Setenv(rateLimitEnabledEnv, "true")
 			t.Setenv(test.envName, test.value)
 			_, err := rateLimitSettingsFromEnv()
@@ -464,7 +532,38 @@ func TestRateLimitSettingsFromEnvRejectsInvalidEnabledConfiguration(t *testing.T
 	}
 }
 
+func TestRateLimitSettingsFromEnvRejectsInvalidRedisConfiguration(t *testing.T) {
+	tests := []struct {
+		name    string
+		envName string
+		value   string
+	}{
+		{name: "unknown store", envName: rateLimitStoreEnv, value: "local"},
+		{name: "malformed address", envName: redisAddrEnv, value: "redis://localhost:6379"},
+		{name: "non-numeric port", envName: redisAddrEnv, value: "localhost:+6379"},
+		{name: "invalid host", envName: redisAddrEnv, value: "bad host:6379"},
+		{name: "empty address", envName: redisAddrEnv, value: ""},
+		{name: "invalid database", envName: redisDBEnv, value: "not-a-number"},
+		{name: "negative database", envName: redisDBEnv, value: "-1"},
+		{name: "invalid failure mode", envName: rateLimitRedisFailureModeEnv, value: "fallback"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			unsetEnvironment(t, rateLimitEnabledEnv, rateLimitStoreEnv, redisAddrEnv, redisPasswordEnv, redisDBEnv, rateLimitRedisFailureModeEnv)
+			t.Setenv(test.envName, test.value)
+			if test.envName == redisAddrEnv || test.envName == redisDBEnv {
+				t.Setenv(rateLimitStoreEnv, "redis")
+			}
+			_, err := rateLimitSettingsFromEnv()
+			if err == nil || !strings.Contains(err.Error(), test.envName) {
+				t.Fatalf("rateLimitSettingsFromEnv() error = %v, want an error identifying %s", err, test.envName)
+			}
+		})
+	}
+}
+
 func TestDisabledRateLimitIgnoresRateValuesAndPreservesHandlerBehavior(t *testing.T) {
+	unsetEnvironment(t, rateLimitStoreEnv, redisAddrEnv, redisPasswordEnv, redisDBEnv, rateLimitRedisFailureModeEnv)
 	t.Setenv(rateLimitEnabledEnv, "false")
 	t.Setenv(rateLimitRateEnv, "invalid")
 	t.Setenv(rateLimitBurstEnv, "0")
@@ -500,6 +599,52 @@ func TestDisabledRateLimitIgnoresRateValuesAndPreservesHandlerBehavior(t *testin
 	}
 	if downstreamCalls.Load() != 2 {
 		t.Fatalf("downstream calls with limiter disabled = %d, want 2", downstreamCalls.Load())
+	}
+}
+
+func TestNewRateLimiterReportsRedisConnectivityFailure(t *testing.T) {
+	options := ratelimit.DefaultRedisOptions()
+	options.Addr = "127.0.0.1:1"
+	options.OperationTimeout = 100 * time.Millisecond
+	options.StartupTimeout = 200 * time.Millisecond
+	settings := rateLimitSettings{
+		Enabled:   true,
+		Config:    ratelimit.DefaultConfig(),
+		StoreName: "redis",
+		Redis:     options,
+	}
+
+	if _, err := newRateLimiter(settings); err == nil || !strings.Contains(err.Error(), "startup connectivity check failed") {
+		t.Fatalf("newRateLimiter() error = %v, want Redis startup connectivity failure", err)
+	}
+}
+
+func TestNewRateLimiterInitializesRedisWithoutMemoryCleanup(t *testing.T) {
+	options := ratelimit.DefaultRedisOptions()
+	if address := os.Getenv("INTELLIGATE_TEST_REDIS_ADDR"); address != "" {
+		options.Addr = address
+	}
+	options.Namespace = fmt.Sprintf("gateway-test-%x", time.Now().UnixNano())
+	settings := rateLimitSettings{
+		Enabled:   true,
+		Config:    ratelimit.DefaultConfig(),
+		StoreName: "redis",
+		Redis:     options,
+	}
+	limiter, err := newRateLimiter(settings)
+	if err != nil {
+		if strings.Contains(err.Error(), "startup connectivity check failed") {
+			t.Skipf("Redis gateway initialization test skipped because Redis is unavailable: %v", err)
+		}
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := limiter.Close(); err != nil {
+			t.Errorf("close Redis limiter: %v", err)
+		}
+	}()
+	if limiter.NeedsCleanup() {
+		t.Fatal("Redis-backed limiter must not start the in-memory cleanup loop")
 	}
 }
 

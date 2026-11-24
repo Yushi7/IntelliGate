@@ -1,6 +1,6 @@
 # Testing Strategy
 
-**Status:** Phase 1 includes Go router/proxy tests and pytest service endpoint tests. Phase 2A and 2B include Go Round Robin, active health-check, and gateway integration tests. Phase 3A adds timeout configuration and proxy timeout tests. Phase 3B adds circuit-breaker state, selector, proxy-outcome, and configuration tests. Phase 3C adds controlled retry, deadline, and admission tests. Phase 4A adds token-bucket, cleanup, configuration, and gateway-middleware tests. Phase 4B.1 adds API-key authentication tests; Phase 4B.2 adds role configuration, per-method authorization, middleware-order, request-context isolation, and gateway integration tests.
+**Status:** Phase 1 includes Go router/proxy tests and pytest service endpoint tests. Phase 2A and 2B include Go Round Robin, active health-check, and gateway integration tests. Phase 3A adds timeout configuration and proxy timeout tests. Phase 3B adds circuit-breaker state, selector, proxy-outcome, and configuration tests. Phase 3C adds controlled retry, deadline, and admission tests. Phase 4A adds in-memory token-bucket, cleanup, configuration, and gateway-middleware tests. Phase 4B.1 adds API-key authentication tests; Phase 4B.2 adds role configuration, per-method authorization, middleware-order, request-context isolation, and gateway integration tests. Phase 5A adds Redis-backed shared-quota, atomicity, TTL, failure-mode, startup, and shutdown tests.
 
 ## Principles
 
@@ -25,6 +25,7 @@ Run the gateway tests:
 ```powershell
 Set-Location gateway
 go test ./...
+go test -count=10 ./internal/ratelimit
 go test -count=10 ./internal/auth
 go test -count=10 ./cmd/gateway
 go test -race ./...
@@ -166,7 +167,7 @@ The default is `5s` when `INTELLIGATE_UPSTREAM_TIMEOUT` is unset. The timeout ca
 
 ## Integration testing
 
-Once components exist, verify gateway-to-Redis rate-limit behavior, gateway-to-PostgreSQL configuration/data access, Prometheus scraping, and service startup/readiness using isolated dependencies. Docker-based integration environments may be introduced with the implementation; none exists in Phase 0.
+Redis-backed rate-limit integration tests use a real Redis instance when available. They create a unique IntelliGate test namespace, clean only keys in that namespace, and never flush a Redis database. Set `INTELLIGATE_TEST_REDIS_ADDR` to use a non-default local test server; otherwise tests try `localhost:6379` and skip Redis-only cases if it is unavailable. PostgreSQL configuration/data access, Prometheus scraping, and deployment readiness remain planned.
 
 ## Gateway-to-service communication
 
@@ -198,9 +199,55 @@ try { (Invoke-WebRequest -UseBasicParsing -Method Post http://localhost:8080/api
 
 Expected behavior: unauthenticated API request returns 401; read-role GET and admin GET return the backend response; read-role POST returns 403 before contacting the service; public health returns 200. Legacy `INTELLIGATE_API_KEYS` remains supported and assigns every key `admin`; migrate to `INTELLIGATE_API_KEY_ROLES` for least privilege, and never set both.
 
-## Rate-limiting testing
+## Rate-limiting testing (implemented in Phases 4A and 5A)
 
-Test token consumption, refill timing, bucket capacity, isolation between clients, and consistent decisions across gateway instances when Redis is available. Verify the documented limit response and headers. Test Redis timeout/unavailability behavior once a fail-open or fail-closed policy is selected.
+Automated memory-store tests cover token consumption/refill, burst capacity, independent clients, IPv4/IPv6 parsing, Retry-After rounding, concurrent capacity, cleanup, public health, and disabled behavior. Redis integration tests cover full initial burst, exhaustion, fixed-point refill, Retry-After, isolated client buckets, quota sharing across separate store instances, concurrent atomic consumption, TTL expiry, request cancellation, operation timeout, Redis close, and fail-open/fail-closed behavior. Startup tests cover defaults, invalid configuration, Redis connectivity failures, successful initialization, and avoiding the memory cleanup loop for Redis mode. Redis-specific tests skip only when no Redis endpoint is available.
+
+Run the repeated limiter and gateway checks from `gateway`:
+
+```powershell
+go test -count=10 ./internal/ratelimit
+go test -count=10 ./cmd/gateway
+```
+
+### Local Redis setup and two-gateway quota demonstration
+
+The memory store is the default and does not require Redis. For Redis mode, start a local Redis 7 container if one is not already running:
+
+```powershell
+docker run --name intelligate-redis -p 6379:6379 -d redis:7-alpine
+```
+
+Start the Product, Order, and User services as described above. In two separate terminals, start gateway instances with identical Redis, rate-limit, and placeholder authentication configuration; use a different listen address for each:
+
+```powershell
+$env:INTELLIGATE_RATE_LIMIT_STORE = "redis"
+$env:INTELLIGATE_REDIS_ADDR = "localhost:6379"
+$env:INTELLIGATE_RATE_LIMIT_RATE = "0.000001"
+$env:INTELLIGATE_RATE_LIMIT_BURST = "20"
+$env:INTELLIGATE_API_KEYS = "local-placeholder-key"
+$env:INTELLIGATE_LISTEN_ADDR = "127.0.0.1:8080" # use :8081 in the second terminal
+Set-Location gateway
+go run .\cmd\gateway
+```
+
+From another PowerShell terminal, send 12 requests through the first instance and 8 through the second, then verify the next request is rate limited across the shared bucket:
+
+```powershell
+$headers = @{ "X-API-Key" = "local-placeholder-key" }
+1..12 | ForEach-Object { Invoke-RestMethod http://127.0.0.1:8080/api/v1/products -Headers $headers | Out-Null }
+1..8 | ForEach-Object { Invoke-RestMethod http://127.0.0.1:8081/api/v1/products -Headers $headers | Out-Null }
+try {
+    Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8080/api/v1/products -Headers $headers
+} catch {
+    [int]$_.Exception.Response.StatusCode
+    $_.Exception.Response.Headers["Retry-After"]
+}
+```
+
+With the example's deliberately low refill rate, the final request should return `429` and a positive `Retry-After`. Redis outages return `503` by default; set `INTELLIGATE_RATE_LIMIT_REDIS_FAILURE_MODE=open` to log a generic warning and allow requests. Never use real API keys or Redis passwords in this example. All gateways must observe the same canonical client IP; forwarded headers are not trusted.
+
+The Redis bucket uses a SHA-256 digest of the canonical IP as its key suffix, server time in the Lua script, and a 10-minute idle TTL. The fixed-point representation has 1,000,000 units per token and Redis mode supports rate/burst values from 0.000001 through 1000 tokens. These integration tests validate behavior, not throughput or performance. The current client configuration is for one Redis address and does not configure TLS, Sentinel, or Cluster.
 
 ## Load-balancing testing
 
@@ -238,4 +285,4 @@ Inject controlled backend failure, latency, and restart/recovery events in a loc
 
 ## Current status
 
-Phase 1 service tests and Phase 2A/2B/3A/3B/3C/4A/4B.1/4B.2 Go routing, health-check, timeout, circuit-breaker, retry, rate-limit, API-key authentication, RBAC, and simulated integration tests are implemented. Record manual verification results in [DEVELOPMENT_LOG.md](./DEVELOPMENT_LOG.md) only after running them. Tests for JWT/OAuth, distributed quotas, databases, adaptive routing, and monitoring are not implemented.
+Phase 1 service tests and Phase 2A/2B/3A/3B/3C/4A/4B.1/4B.2/5A Go routing, health-check, timeout, circuit-breaker, retry, memory/Redis rate-limit, API-key authentication, RBAC, and integration tests are implemented. Record manual verification results in [DEVELOPMENT_LOG.md](./DEVELOPMENT_LOG.md) only after running them. Tests for JWT/OAuth, distributed authentication, databases, adaptive routing, and monitoring are not implemented.

@@ -1,10 +1,10 @@
 # IntelliGate Proposed Architecture
 
-**Status:** Phase 1 implements the Go HTTP reverse proxy and three FastAPI services. Phase 2A adds per-service Round Robin pools; Phase 2B adds active health probes and selects only healthy instances; Phase 3A adds configurable upstream request timeouts; Phase 3B adds per-backend circuit breakers; Phase 3C adds bounded retries for eligible upstream transport failures; Phase 4A adds an in-memory per-client-IP token bucket; Phase 4B.1 adds API-key authentication; Phase 4B.2 adds role-based access control. JWT/OAuth, distributed authentication/rate limiting, adaptive routing, databases, monitoring, and the other integrations described below remain proposed.
+**Status:** Phase 1 implements the Go HTTP reverse proxy and three FastAPI services. Phase 2A adds per-service Round Robin pools; Phase 2B adds active health probes and selects only healthy instances; Phase 3A adds configurable upstream request timeouts; Phase 3B adds per-backend circuit breakers; Phase 3C adds bounded retries for eligible upstream transport failures; Phase 4A adds an in-memory per-client-IP token bucket; Phase 4B.1 adds API-key authentication; Phase 4B.2 adds role-based access control; Phase 5A adds optional Redis-backed shared token buckets. JWT/OAuth, distributed authentication, adaptive routing, databases, monitoring, and the other integrations described below remain proposed.
 
 ## 1. High-level system architecture
 
-The Go gateway is the public entry point for client API traffic. It proxies requests to configured Python FastAPI backend instances using Go's standard HTTP reverse-proxy capabilities and selects an instance round-robin from each service's healthy pool. Direct backend `/health` probes update eligibility. Future phases may add additional gateway policies and service-owned domain APIs. Redis is designated for distributed rate-limit state; PostgreSQL for persistent application data and selected configuration. Prometheus/Grafana, Locust, the dashboard, and anomaly-detection component remain planned.
+The Go gateway is the public entry point for client API traffic. It proxies requests to configured Python FastAPI backend instances using Go's standard HTTP reverse-proxy capabilities and selects an instance round-robin from each service's healthy pool. Direct backend `/health` probes update eligibility. Future phases may add additional gateway policies and service-owned domain APIs. Redis is implemented as an optional shared rate-limit store; PostgreSQL is designated for persistent application data and selected configuration. Prometheus/Grafana, Locust, the dashboard, and anomaly-detection component remain planned.
 
 ```mermaid
 flowchart LR
@@ -13,7 +13,7 @@ flowchart LR
     Gateway -->|proxy| Product[Product FastAPI Service]
     Gateway -->|proxy| Order[Order FastAPI Service]
     Gateway -->|proxy| User[User FastAPI Service]
-    Gateway -. planned shared rate-limit state .-> Redis[(Redis)]
+    Gateway -->|optional atomic shared token buckets| Redis[(Redis)]
     Product --> PostgreSQL[(PostgreSQL)]
     Order --> PostgreSQL
     User --> PostgreSQL
@@ -23,7 +23,7 @@ flowchart LR
     Prometheus -. planned signals .-> Anomaly[Python + scikit-learn anomaly analysis]
 ```
 
-**Status note:** Gateway-to-service HTTP connections, API-key authentication, Round Robin selection, active health checks, configurable upstream request timeouts, per-backend circuit breakers, controlled retries, and in-memory per-IP rate limiting are implemented. Redis, PostgreSQL, Prometheus, Grafana, Locust, dashboard, and anomaly-detection connections remain proposed. No containerized deployment is included.
+**Status note:** Gateway-to-service HTTP connections, API-key authentication, Round Robin selection, active health checks, configurable upstream request timeouts, per-backend circuit breakers, controlled retries, and memory/Redis per-IP rate limiting are implemented. PostgreSQL, Prometheus, Grafana, Locust, dashboard, and anomaly-detection connections remain proposed. No containerized deployment is included.
 
 ### Phase 1/4B.2 runtime configuration
 
@@ -42,7 +42,7 @@ Application proxy requests use `INTELLIGATE_UPSTREAM_TIMEOUT`, a positive Go dur
 
 Circuit-breaker policy is global and applied independently to every configured backend. Startup accepts `INTELLIGATE_CIRCUIT_BREAKER_FAILURE_THRESHOLD` (`5`), `INTELLIGATE_CIRCUIT_BREAKER_OPEN_COOLDOWN` (`10s`), `INTELLIGATE_CIRCUIT_BREAKER_HALF_OPEN_MAX_REQUESTS` (`1`), and `INTELLIGATE_CIRCUIT_BREAKER_HALF_OPEN_SUCCESS_THRESHOLD` (`1`). All values must be positive; malformed or nonpositive values fail startup.
 
-The in-memory per-client token bucket is enabled by default. `INTELLIGATE_RATE_LIMIT_ENABLED=false` disables it. When enabled, `INTELLIGATE_RATE_LIMIT_RATE` defaults to 10 tokens per second and `INTELLIGATE_RATE_LIMIT_BURST` defaults to a capacity of 20 tokens; malformed, non-finite, zero, or negative values fail startup. Client identity is the canonical IP parsed from `RemoteAddr`; `X-Forwarded-For` and `X-Real-IP` are ignored. Gateway `GET /health` is exempt. Idle buckets expire after 10 minutes and a cleanup loop runs every minute. This quota is local to one gateway process; shared Redis state remains proposed.
+Rate limiting is enabled by default. `INTELLIGATE_RATE_LIMIT_STORE` selects `memory` (default) or `redis`; `INTELLIGATE_RATE_LIMIT_ENABLED=false` disables limiting. The default policy is 10 tokens per second with a burst capacity of 20, overridable through `INTELLIGATE_RATE_LIMIT_RATE` and `INTELLIGATE_RATE_LIMIT_BURST`. Enabled values must be finite and positive. The Redis connection uses `INTELLIGATE_REDIS_ADDR` (default `localhost:6379`), optional `INTELLIGATE_REDIS_PASSWORD`, and `INTELLIGATE_REDIS_DB` (default `0`). `INTELLIGATE_RATE_LIMIT_REDIS_FAILURE_MODE` accepts `closed` (default, return 503) or `open` (log a generic warning and allow requests). Redis mode performs a bounded startup ping and never falls back to memory. Client identity is the canonical IP parsed from `RemoteAddr`; `X-Forwarded-For` and `X-Real-IP` are ignored. Gateway `GET /health` is exempt. Idle buckets expire after 10 minutes; only memory mode runs the periodic cleanup loop.
 
 API-key authentication is enabled by default. `INTELLIGATE_AUTH_ENABLED=false` explicitly disables authentication. Configure credentials using exactly one of `INTELLIGATE_API_KEY_ROLES` (a JSON object mapping keys to `admin`, `read`, or `write`) or legacy comma-separated `INTELLIGATE_API_KEYS`; setting both is a startup error. The legacy list remains compatible and assigns every key the `admin` role. Role JSON must be a non-empty object with unique, non-empty keys and recognized role names. Malformed JSON, duplicate/ambiguous keys, invalid entries, and unknown roles fail startup without exposing credential values. Surrounding key whitespace is trimmed.
 
@@ -79,7 +79,7 @@ Each service will own its domain API. Service-level validation and persistence d
 
 ### Redis and PostgreSQL
 
-- **Redis:** Planned shared state for distributed token bucket rate limiting. The implemented Phase 4A limiter is in memory and does not require Redis.
+- **Redis:** Optional shared rate-limit state implemented in Phase 5A using `github.com/redis/go-redis/v9` and an atomic Lua token-bucket operation. Redis is not required in the default memory mode.
 - **PostgreSQL:** Persistent application records and selected gateway/service configuration. Configuration ownership, schema, and migrations remain implementation decisions.
 
 ### Monitoring and supporting tools
@@ -92,13 +92,13 @@ Each service will own its domain API. Service-level validation and persistence d
 
 ## 3. Request lifecycle
 
-The Phase 4B.2 application request path is:
+The Phase 5A application request path is:
 
 1. Receive an HTTP request at port 8080.
 2. Log the method and path without query parameters or credentials.
 3. Validate `X-API-Key` on `/api/v1` and `/api/v1/*`; return 401 for a missing or invalid key. Resolve the role from the key and attach it to the request context. `GET /health` is public.
 4. Authorize the method for that role; return 403 if it is unsupported or not permitted. Client role headers and query parameters are ignored.
-5. Consume a token from the client's IP bucket; return 429 with `Retry-After` if no token is available. `GET /health` also bypasses this limiter.
+5. Consume a token from the configured memory or Redis client-IP bucket; return 429 with `Retry-After` if the bucket is exhausted, or 503 if Redis fails in `closed` mode. Redis errors in `open` mode produce a generic warning and allow the request. `GET /health` also bypasses this limiter.
 6. Match the request path to one of the three service prefixes; return 404 if none matches.
 7. Select the next healthy configured instance whose breaker admits a request; return 503 if none is eligible.
 8. Proxy the request with its original path and query; eligible GET/HEAD transport failures may retry under the bounded Phase 3C policy.
@@ -131,7 +131,7 @@ The overall request retry deadline is derived from `(maximum attempts × INTELLI
 sequenceDiagram
     participant C as Client
     participant G as Go Gateway
-    participant R as Redis (planned)
+    participant R as Redis (optional)
     participant LB as Backend Pool / Router
     participant S as FastAPI Service (planned)
     participant P as Prometheus (planned)
@@ -139,7 +139,7 @@ sequenceDiagram
     G->>G: Log method/path; do not log credentials
     G->>G: Authenticate API key and resolve role unless GET /health
     G->>G: Authorize method for role
-    G->>G: Consume process-local client token unless GET /health
+    G->>G: Consume memory or shared Redis token unless GET /health
     G->>G: Match route
     G->>LB: Select healthy instance (Round Robin implemented)
     LB-->>G: Selected backend
@@ -175,13 +175,18 @@ This is process-local shared-key authentication, not JWT/OAuth or a distributed 
 
 ## 5. Rate-limiting architecture
 
-### In-memory token bucket (implemented in Phase 4A)
+The gateway keeps one token-bucket policy and supports two storage modes selected through `INTELLIGATE_RATE_LIMIT_STORE`:
 
-The gateway uses floating-point token accounting with time-based refill, a default rate of 10 tokens per second, and a burst capacity of 20 tokens. Each accepted request consumes one token. Buckets are keyed by the canonical client IP parsed from the connection's `RemoteAddr`; forwarded-IP headers are not trusted. Bucket operations and cleanup share a short mutex, which is released before downstream routing or proxy execution. Inactive entries expire after 10 minutes; cleanup runs every minute.
+- **Memory (default, Phase 4A):** floating-point tokens, time-based refill, and a mutex-protected per-client map. The default is 10 tokens/second and burst 20. Inactive buckets expire after 10 minutes and a cleanup loop runs every minute. Quotas are process-local.
+- **Redis (Phase 5A):** each gateway instance calls an atomic Lua script to read, refill, consume, and update the same per-client bucket. Redis server `TIME` supplies the clock. The key prefix is IntelliGate-specific (`intelligate:ratelimit:v1`), with the canonical IP represented only by its stable SHA-256 digest. Redis applies a 10-minute idle TTL; no in-memory cleanup goroutine runs in this mode.
 
-When a request has insufficient tokens, the gateway returns HTTP 429 with `{"error":"rate limit exceeded"}` and a positive, rounded-up `Retry-After` value in seconds. No global-quota headers are emitted. `GET /health` is exempt. Configuration uses `INTELLIGATE_RATE_LIMIT_ENABLED` (default `true`), `INTELLIGATE_RATE_LIMIT_RATE` (default `10`), and `INTELLIGATE_RATE_LIMIT_BURST` (default `20`). Rate and burst must be finite positive numbers when enabled.
+The Redis script stores integer microtokens (1,000,000 units per token), preserving fractional accounting without floating-point token state. Redis-mode rate and burst values are rounded to the nearest microtoken and must be representable from 0.000001 through 1000 tokens; the bound keeps intermediate integer arithmetic within Lua's exact-integer range. The default policy remains 10 tokens/second and burst 20 in either store.
 
-The limiter is process-local. Shared buckets across gateway instances using Redis, policy administration, and behavior for distributed-state failures remain future work.
+`INTELLIGATE_RATE_LIMIT_ENABLED` defaults to `true`; setting it to `false` bypasses the limiter and preserves prior request behavior. `INTELLIGATE_RATE_LIMIT_RATE` and `INTELLIGATE_RATE_LIMIT_BURST` override positive finite values. Redis configuration is `INTELLIGATE_REDIS_ADDR` (default `localhost:6379`), optional `INTELLIGATE_REDIS_PASSWORD`, and `INTELLIGATE_REDIS_DB` (default `0`). Startup validates Redis settings and performs a bounded connectivity check; selecting Redis never silently falls back to memory. Redis operations have a bounded timeout and inherit request cancellation.
+
+`INTELLIGATE_RATE_LIMIT_REDIS_FAILURE_MODE=closed` is the default: a Redis operation error returns HTTP 503 with `{"error":"rate limiter unavailable"}`. `open` logs a generic warning and allows the request. An outage is never reported as 429. Exhausted buckets return HTTP 429 with `{"error":"rate limit exceeded"}` and a positive, rounded-up `Retry-After` value in seconds. No global-quota headers are emitted. `GET /health` is exempt in both modes. Client identity is parsed from `RemoteAddr`; forwarded-IP headers are not trusted.
+
+Use the same Redis address, database, rate, and burst configuration for every gateway instance that must share a quota. For a local two-process demonstration, `INTELLIGATE_LISTEN_ADDR` defaults to `:8080` and may be changed to another host/port such as `127.0.0.1:8081`. The Redis password is provided through the environment and is never logged. This implementation uses a single Redis address and does not configure TLS, Sentinel, or Cluster; production deployments need protected secret management, network isolation, and transport protection. Redis availability and persistence depend on the Redis deployment; no distributed authentication or per-key quotas are provided.
 
 ## 6. Routing and load balancing
 
@@ -270,4 +275,4 @@ A Python component using scikit-learn is planned to explore anomalies in aggrega
 
 **Fixed decisions:** Go gateway; standard-library reverse-proxy capabilities; FastAPI services; per-service Round Robin across configured backend URLs; independent health and circuit-breaker state per backend; Redis-backed distributed rate-limit state; PostgreSQL for persistent records/configuration; Prometheus and Grafana; Locust; future comparison with Adaptive Least-Loaded.
 
-**Open decisions:** Additional local backend port assignments; runtime pool reload; health flapping/hysteresis policy; routing score and EWMA parameters; breaker metrics and policy overrides per service; Redis failure mode; auth key lifecycle and admin authorization; metrics names and cardinality; dashboard interaction; anomaly model and operation mode.
+**Open decisions:** Additional local backend port assignments; runtime pool reload; health flapping/hysteresis policy; routing score and EWMA parameters; breaker metrics and policy overrides per service; auth key lifecycle and admin authorization; metrics names and cardinality; dashboard interaction; anomaly model and operation mode.

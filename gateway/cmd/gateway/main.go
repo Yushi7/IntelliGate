@@ -31,9 +31,15 @@ const (
 	apiKeysEnv                         = "INTELLIGATE_API_KEYS"
 	apiKeyRolesEnv                     = "INTELLIGATE_API_KEY_ROLES"
 	upstreamTimeoutEnv                 = "INTELLIGATE_UPSTREAM_TIMEOUT"
+	listenAddrEnv                      = "INTELLIGATE_LISTEN_ADDR"
 	rateLimitEnabledEnv                = "INTELLIGATE_RATE_LIMIT_ENABLED"
 	rateLimitRateEnv                   = "INTELLIGATE_RATE_LIMIT_RATE"
 	rateLimitBurstEnv                  = "INTELLIGATE_RATE_LIMIT_BURST"
+	rateLimitStoreEnv                  = "INTELLIGATE_RATE_LIMIT_STORE"
+	redisAddrEnv                       = "INTELLIGATE_REDIS_ADDR"
+	redisPasswordEnv                   = "INTELLIGATE_REDIS_PASSWORD"
+	redisDBEnv                         = "INTELLIGATE_REDIS_DB"
+	rateLimitRedisFailureModeEnv       = "INTELLIGATE_RATE_LIMIT_REDIS_FAILURE_MODE"
 	breakerFailureThresholdEnv         = "INTELLIGATE_CIRCUIT_BREAKER_FAILURE_THRESHOLD"
 	breakerOpenCooldownEnv             = "INTELLIGATE_CIRCUIT_BREAKER_OPEN_COOLDOWN"
 	breakerHalfOpenMaxRequestsEnv      = "INTELLIGATE_CIRCUIT_BREAKER_HALF_OPEN_MAX_REQUESTS"
@@ -55,16 +61,25 @@ func runGateway() error {
 	if err != nil {
 		return err
 	}
+	listenAddr, err := listenAddressFromEnv()
+	if err != nil {
+		return err
+	}
 	rateSettings, err := rateLimitSettingsFromEnv()
 	if err != nil {
 		return err
 	}
 	var rateLimiter *ratelimit.Limiter
-	if rateSettings.Enabled {
-		rateLimiter, err = ratelimit.New(rateSettings.Config)
-		if err != nil {
-			return err
-		}
+	rateLimiter, err = newRateLimiter(rateSettings)
+	if err != nil {
+		return err
+	}
+	if rateLimiter != nil {
+		defer func() {
+			if err := rateLimiter.Close(); err != nil {
+				log.Printf("warning: failed to close rate-limit store: %v", err)
+			}
+		}()
 	}
 	breakerConfig, err := circuitBreakerConfigFromEnv()
 	if err != nil {
@@ -100,13 +115,13 @@ func runGateway() error {
 	}
 
 	server := &http.Server{
-		Addr:              ":8080",
+		Addr:              listenAddr,
 		Handler:           newHandlerWithAuthentication(products, orders, users, authSettings.Authenticator, rateLimiter),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
 	log.Printf("IntelliGate listening on %s", server.Addr)
-	if rateLimiter != nil {
+	if rateLimiter != nil && rateLimiter.NeedsCleanup() {
 		cleanupContext, cancelCleanup := context.WithCancel(ctx)
 		cleanupDone := make(chan struct{})
 		go func() {
@@ -119,6 +134,30 @@ func runGateway() error {
 		}()
 	}
 	return serveWithHealthChecks(ctx, server, checker)
+}
+
+func listenAddressFromEnv() (string, error) {
+	address := ":8080"
+	if value, configured := os.LookupEnv(listenAddrEnv); configured {
+		address = value
+	}
+	if strings.TrimSpace(address) != address {
+		return "", fmt.Errorf("%s must be a host:port address", listenAddrEnv)
+	}
+	host, port, err := net.SplitHostPort(address)
+	if err != nil || strings.ContainsAny(host, " \t\r\n") {
+		return "", fmt.Errorf("%s must be a valid host:port address", listenAddrEnv)
+	}
+	for _, character := range port {
+		if character < '0' || character > '9' {
+			return "", fmt.Errorf("%s must include a numeric port", listenAddrEnv)
+		}
+	}
+	portNumber, err := strconv.Atoi(port)
+	if err != nil || portNumber < 1 || portNumber > 65535 {
+		return "", fmt.Errorf("%s must include a port between 1 and 65535", listenAddrEnv)
+	}
+	return address, nil
 }
 
 type authenticationSettings struct {
@@ -272,14 +311,18 @@ func circuitBreakerConfigFromEnv() (circuitbreaker.Config, error) {
 }
 
 type rateLimitSettings struct {
-	Enabled bool
-	Config  ratelimit.Config
+	Enabled   bool
+	Config    ratelimit.Config
+	StoreName string
+	Redis     ratelimit.RedisOptions
 }
 
 func rateLimitSettingsFromEnv() (rateLimitSettings, error) {
 	settings := rateLimitSettings{
-		Enabled: true,
-		Config:  ratelimit.DefaultConfig(),
+		Enabled:   true,
+		Config:    ratelimit.DefaultConfig(),
+		StoreName: "memory",
+		Redis:     ratelimit.DefaultRedisOptions(),
 	}
 	if value, configured := os.LookupEnv(rateLimitEnabledEnv); configured {
 		enabled, err := strconv.ParseBool(value)
@@ -287,6 +330,39 @@ func rateLimitSettingsFromEnv() (rateLimitSettings, error) {
 			return rateLimitSettings{}, fmt.Errorf("%s must be a boolean: %w", rateLimitEnabledEnv, err)
 		}
 		settings.Enabled = enabled
+	}
+
+	if value, configured := os.LookupEnv(rateLimitStoreEnv); configured {
+		settings.StoreName = strings.ToLower(strings.TrimSpace(value))
+	}
+	if settings.StoreName != "memory" && settings.StoreName != "redis" {
+		return rateLimitSettings{}, fmt.Errorf("%s must be either memory or redis", rateLimitStoreEnv)
+	}
+	if value, configured := os.LookupEnv(redisAddrEnv); configured {
+		settings.Redis.Addr = value
+	}
+	if value, configured := os.LookupEnv(redisPasswordEnv); configured {
+		settings.Redis.Password = value
+	}
+	if value, configured := os.LookupEnv(redisDBEnv); configured {
+		db, err := strconv.Atoi(value)
+		if err != nil || db < 0 {
+			return rateLimitSettings{}, fmt.Errorf("%s must be a non-negative integer", redisDBEnv)
+		}
+		settings.Redis.DB = db
+	}
+	if err := ratelimit.ValidateRedisAddress(settings.Redis.Addr); err != nil {
+		return rateLimitSettings{}, fmt.Errorf("%s: %w", redisAddrEnv, err)
+	}
+	if value, configured := os.LookupEnv(rateLimitRedisFailureModeEnv); configured {
+		switch strings.ToLower(strings.TrimSpace(value)) {
+		case string(ratelimit.FailureModeClosed):
+			settings.Config.FailureMode = ratelimit.FailureModeClosed
+		case string(ratelimit.FailureModeOpen):
+			settings.Config.FailureMode = ratelimit.FailureModeOpen
+		default:
+			return rateLimitSettings{}, fmt.Errorf("%s must be either closed or open", rateLimitRedisFailureModeEnv)
+		}
 	}
 	if !settings.Enabled {
 		return settings, nil
@@ -303,6 +379,31 @@ func rateLimitSettingsFromEnv() (rateLimitSettings, error) {
 	settings.Config.Rate = rate
 	settings.Config.Burst = burst
 	return settings, nil
+}
+
+func newRateLimiter(settings rateLimitSettings) (*ratelimit.Limiter, error) {
+	if !settings.Enabled {
+		return nil, nil
+	}
+	if settings.StoreName == "memory" {
+		return ratelimit.New(settings.Config)
+	}
+	if settings.StoreName != "redis" {
+		return nil, fmt.Errorf("unsupported rate-limit store %q", settings.StoreName)
+	}
+
+	store, err := ratelimit.NewRedisStore(settings.Config, settings.Redis)
+	if err != nil {
+		return nil, fmt.Errorf("initialize Redis rate limiter: %w", err)
+	}
+	limiter, err := ratelimit.NewWithStore(settings.Config, store)
+	if err != nil {
+		if closeErr := store.Close(); closeErr != nil {
+			return nil, errors.Join(err, fmt.Errorf("close Redis rate-limit store after initialization failure: %w", closeErr))
+		}
+		return nil, err
+	}
+	return limiter, nil
 }
 
 func positiveFloatFromEnv(envName string, defaultValue float64) (float64, error) {

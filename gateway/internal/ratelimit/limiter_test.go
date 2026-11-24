@@ -150,7 +150,7 @@ func TestCleanupExpiresIdleBucketsButKeepsRecentlyActiveBuckets(t *testing.T) {
 	if removed := limiter.cleanupExpiredAt(current); removed != 1 {
 		t.Fatalf("first cleanup removed %d buckets, want only the idle bucket", removed)
 	}
-	if _, exists := limiter.clients["active"]; !exists {
+	if _, exists := limiter.memoryStore.clients["active"]; !exists {
 		t.Fatal("cleanup removed a recently active bucket")
 	}
 
@@ -161,8 +161,8 @@ func TestCleanupExpiresIdleBucketsButKeepsRecentlyActiveBuckets(t *testing.T) {
 	if removed := limiter.cleanupExpiredAt(current); removed != 1 {
 		t.Fatalf("second cleanup removed %d buckets, want the now-idle bucket", removed)
 	}
-	if len(limiter.clients) != 0 {
-		t.Fatalf("client buckets remaining after expiry = %d, want 0", len(limiter.clients))
+	if len(limiter.memoryStore.clients) != 0 {
+		t.Fatalf("client buckets remaining after expiry = %d, want 0", len(limiter.memoryStore.clients))
 	}
 }
 
@@ -187,8 +187,8 @@ func TestCleanupConcurrentWithActiveBucketAccess(t *testing.T) {
 		}
 	}()
 	workers.Wait()
-	if len(limiter.clients) != 1 {
-		t.Fatalf("active client bucket count = %d, want 1", len(limiter.clients))
+	if len(limiter.memoryStore.clients) != 1 {
+		t.Fatalf("active client bucket count = %d, want 1", len(limiter.memoryStore.clients))
 	}
 }
 
