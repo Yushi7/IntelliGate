@@ -199,3 +199,26 @@ This live demonstration is separate from the automated Go tests and is not a per
 - `go test -count=10 ./internal/proxy`: passed.
 - `go test -count=10 ./internal/circuitbreaker`: passed.
 - `git diff --check`: passed; Git emitted only Windows line-ending normalization notices. No race-detector, live manual retry, or performance benchmark result is claimed.
+
+## Phase 4A in-memory token bucket rate limiting
+
+**Status:** Implemented and verified with automated Go tests. No commit was created.
+
+### Implemented
+
+- Added a concurrency-safe in-memory token bucket keyed by the canonical client IP parsed from `RemoteAddr`. Forwarded-IP headers are ignored.
+- Enabled rate limiting by default with a 10-token/second refill rate and capacity 20. `GET /health` is exempt; rejected requests return HTTP 429 with JSON and a positive rounded-up `Retry-After`.
+- Added startup configuration through `INTELLIGATE_RATE_LIMIT_ENABLED`, `INTELLIGATE_RATE_LIMIT_RATE`, and `INTELLIGATE_RATE_LIMIT_BURST`. Enabled rate and burst values must be finite and positive; explicitly disabled mode bypasses the limiter.
+- Expire client buckets after 10 minutes of inactivity and clean them every minute. Bucket accounting and cleanup share a short mutex; downstream handlers run after the lock is released.
+- Kept limits process-local; no Redis or global-quota headers were added.
+
+### Verification
+
+- `gofmt` completed for all changed Go files.
+- `go test ./...` from `gateway`: passed for `cmd/gateway`, `internal/balancer`, `internal/circuitbreaker`, `internal/health`, `internal/proxy`, `internal/ratelimit`, and `internal/router`.
+- `go test -count=10 ./internal/ratelimit`: passed.
+- `go test -count=10 ./cmd/gateway`: passed.
+- `git diff --check`: passed; Git reported only Windows line-ending normalization notices.
+- Manual verification used 1 token/second and burst capacity 5: the first five rapid requests returned HTTP 200, and subsequent requests returned HTTP 429 with `Retry-After: 1` and `{"error":"rate limit exceeded"}`.
+- Confirmed `GET /health` remained accessible with HTTP 200 and normal requests succeeded again after token refill.
+- This limiter is process-local, not distributed. No race-detector run or performance benchmark is claimed.

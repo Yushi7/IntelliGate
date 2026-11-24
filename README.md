@@ -4,7 +4,7 @@
 
 IntelliGate is an API gateway and demonstration environment for routing traffic to an e-commerce application's Product, Order, and User services. The project is being built to explore secure client access, traffic management, service resilience, and observability in a modular microservices system.
 
-> **Phase 3C status:** The Go gateway and three FastAPI demonstration services are implemented. The gateway uses configurable per-service Round Robin pools, active health checks, upstream request timeouts, per-backend circuit breakers, and bounded retries for eligible GET/HEAD upstream transport failures. Authentication, rate limiting, adaptive routing, persistence, monitoring, dashboard, and deployment features remain planned.
+> **Phase 4A status:** The Go gateway and three FastAPI demonstration services are implemented. The gateway uses configurable per-service Round Robin pools, active health checks, upstream request timeouts, per-backend circuit breakers, bounded retries for eligible GET/HEAD transport failures, and an in-memory per-client-IP token bucket. Authentication, distributed rate-limit storage, adaptive routing, persistence, monitoring, dashboard, and deployment features remain planned.
 
 ## Problem
 
@@ -28,15 +28,17 @@ Microservice applications need a consistent entry point to authenticate clients,
 | Configurable upstream request timeout | Implemented in Phase 3A; 5-second default |
 | Per-backend circuit breakers | Implemented in Phase 3B |
 | Bounded retries for eligible GET/HEAD transport failures | Implemented in Phase 3C |
+| In-memory per-client-IP token bucket rate limiting | Implemented in Phase 4A |
 | Gateway and service tests | Implemented in Phase 1 |
 | API key authentication | Planned |
-| Per-client token bucket rate limiting backed by Redis | Planned |
+| Shared/distributed rate limiting backed by Redis | Planned |
 | Round Robin baseline routing | Implemented in Phase 2A |
 | Adaptive least-loaded routing | Planned |
 | EWMA backend latency tracking | Planned |
 | Backend health monitoring and recovery | Implemented in Phase 2B |
 | Circuit breaker | Implemented in Phase 3B |
 | Controlled upstream retries | Implemented in Phase 3C |
+| In-memory rate limiting | Implemented in Phase 4A |
 | Prometheus metrics and Grafana dashboards | Planned |
 | Traffic anomaly detection using Python and scikit-learn | Planned |
 | Product, Order, and User FastAPI services | Implemented in Phase 1 |
@@ -46,7 +48,9 @@ Microservice applications need a consistent entry point to authenticate clients,
 
 ## Architecture
 
-Clients send service requests to the Go gateway on port 8080. It round-robins among configured instances that pass direct `/health` checks and have an available circuit-breaker permit. Breakers are per instance: after 5 qualifying transport failures, an instance is excluded for a 10-second cooldown before a half-open trial is allowed. A failed trial reopens it; the configured number of complete upstream responses closes it. Configure thresholds with the `INTELLIGATE_CIRCUIT_BREAKER_*` environment variables. A 5-second upstream timeout is the default (`INTELLIGATE_UPSTREAM_TIMEOUT` overrides it); GET and HEAD requests retry eligible pre-header transport failures up to twice, with 100ms and 200ms backoffs. The overall retry budget is `(3 × upstream timeout) + 300ms` (15.3 seconds by default). GET/HEAD bodies require `GetBody` for replay. Completed application responses and response-body streaming failures are not retried. Timeout before headers returns 504, exhausted ordinary proxy failures return 502, and no initially eligible backend returns 503. Gateway `GET /health` remains independent of backend state. Redis, PostgreSQL, Prometheus, and Grafana integrations remain planned. See [ARCHITECTURE.md](./ARCHITECTURE.md) for details.
+Clients send service requests to the Go gateway on port 8080. Before routing, an in-memory token bucket applies per-client-IP limits: 10 tokens/second with a capacity of 20 by default. `INTELLIGATE_RATE_LIMIT_ENABLED=false` disables it; `INTELLIGATE_RATE_LIMIT_RATE` and `INTELLIGATE_RATE_LIMIT_BURST` override positive values. Client identity comes from the parsed `RemoteAddr`; forwarded-IP headers are not trusted. `GET /health` is exempt. Inactive buckets expire after 10 minutes and are cleaned every minute. A rejected request receives 429 with `Retry-After`; the quota is process-local, not shared across gateway instances.
+
+The gateway round-robins among configured instances that pass direct `/health` checks and have an available circuit-breaker permit. Breakers are per instance: after 5 qualifying transport failures, an instance is excluded for a 10-second cooldown before a half-open trial is allowed. A failed trial reopens it; the configured number of complete upstream responses closes it. Configure thresholds with the `INTELLIGATE_CIRCUIT_BREAKER_*` environment variables. A 5-second upstream timeout is the default (`INTELLIGATE_UPSTREAM_TIMEOUT` overrides it); GET and HEAD requests retry eligible pre-header transport failures up to twice, with 100ms and 200ms backoffs. The overall retry budget is `(3 × upstream timeout) + 300ms` (15.3 seconds by default). GET/HEAD bodies require `GetBody` for replay. Completed application responses and response-body streaming failures are not retried. Timeout before headers returns 504, exhausted ordinary proxy failures return 502, and no initially eligible backend returns 503. Gateway `GET /health` remains independent of backend state. Distributed Redis rate limiting, PostgreSQL, Prometheus, and Grafana integrations remain planned. See [ARCHITECTURE.md](./ARCHITECTURE.md) for details.
 
 ## Technology stack
 
@@ -117,10 +121,12 @@ Phase 0 created the directory structure; Phase 1 adds gateway and service source
 | 2B | Add active backend health checks and health-aware Round Robin | Implemented; tests included |
 | 3A | Add configurable upstream request timeouts | Implemented; tests included |
 | 3B | Add per-backend circuit breakers | Implemented; tests included |
+| 3C | Add bounded retries for eligible upstream transport failures | Implemented; tests included |
+| 4A | Add in-memory token-bucket rate limiting per client IP | Implemented; tests included |
 | Later | Add authentication, rate limiting, adaptive routing, and metrics | Pending |
 | Later | Add dashboard, anomaly detection, load experiments, and deployment automation | Pending |
 
-Phase 1, Phase 2A, Phase 2B, Phase 3A, Phase 3B, and Phase 3C implementations are recorded below. Later-phase work remains pending.
+Phase 1, Phase 2A, Phase 2B, Phase 3A, Phase 3B, Phase 3C, and Phase 4A implementations are recorded below. Later-phase work remains pending.
 
 ## Run locally
 
@@ -165,6 +171,6 @@ There is no Docker deployment configuration. Run the gateway and services direct
 
 ## Current implementation status
 
-- **Implemented:** Phase 1 Go reverse proxy and three FastAPI services; Phase 2A per-service Round Robin; Phase 2B health checks and health-aware selection; Phase 3A configurable upstream request timeout; Phase 3B per-backend circuit breakers; Phase 3C bounded controlled retries.
-- **Not implemented:** Authentication, rate limiting, adaptive routing, database/cache integration, monitoring, dashboard, load tests, Docker configuration, and CI/CD workflows.
+- **Implemented:** Phase 1 Go reverse proxy and three FastAPI services; Phase 2A per-service Round Robin; Phase 2B health checks and health-aware selection; Phase 3A configurable upstream request timeout; Phase 3B per-backend circuit breakers; Phase 3C bounded controlled retries; Phase 4A in-memory per-client-IP token bucket.
+- **Not implemented:** Authentication, distributed rate-limit storage, adaptive routing, database/cache integration, monitoring, dashboard, load tests, Docker configuration, and CI/CD workflows.
 - **Verification:** Current test and manual integration procedures are recorded in [TESTING.md](./TESTING.md); actual run results are recorded in [DEVELOPMENT_LOG.md](./DEVELOPMENT_LOG.md).

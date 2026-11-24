@@ -1,6 +1,6 @@
 # API Documentation
 
-**Status:** Phase 1 implements the service `GET /`, `GET /health`, sample collection GET endpoints, gateway proxy routing, and gateway `GET /health`. Phase 2A adds round-robin distribution; Phase 2B restricts selection to backends whose direct `/health` probe returned 2xx; Phase 3A adds configurable upstream request timeouts; Phase 3B adds per-backend circuit breakers; Phase 3C adds bounded retries for eligible GET/HEAD transport failures. Client-facing service routes are unchanged. Other operations and policies remain planned.
+**Status:** Phase 1 implements the service `GET /`, `GET /health`, sample collection GET endpoints, gateway proxy routing, and gateway `GET /health`. Phase 2A adds round-robin distribution; Phase 2B restricts selection to backends whose direct `/health` probe returned 2xx; Phase 3A adds configurable upstream request timeouts; Phase 3B adds per-backend circuit breakers; Phase 3C adds bounded retries for eligible GET/HEAD transport failures; Phase 4A adds in-memory per-client-IP token-bucket rate limiting. Client-facing service routes are unchanged. Other operations and policies remain planned.
 
 ## Conventions
 
@@ -9,6 +9,9 @@
 - The gateway listens on port `8080`; single-instance defaults are Product `8001`, Order `8002`, and User `8003`.
 - Optional multiple instances are configured with comma-separated full URLs in `PRODUCT_SERVICE_URLS`, `ORDER_SERVICE_URLS`, and `USER_SERVICE_URLS`. No additional port assignment is mandated.
 - The gateway probes each backend directly with `GET /health` every 5 seconds and a 2-second timeout. Redirects are not followed. Each service request goes to the next healthy configured instance.
+- Rate limiting is enabled by default. `INTELLIGATE_RATE_LIMIT_ENABLED` accepts `true` or `false` (unset means `true`); `INTELLIGATE_RATE_LIMIT_RATE` defaults to 10 tokens per second and `INTELLIGATE_RATE_LIMIT_BURST` defaults to 20 tokens. When enabled, rate and burst must be finite positive numbers or startup fails.
+- The token bucket is in memory, keyed by the IP parsed from `RemoteAddr`; `X-Forwarded-For` and `X-Real-IP` are not trusted. Idle buckets expire after 10 minutes and are cleaned every minute. `GET /health` is exempt. Limits are per gateway process, not global across instances.
+- A request with insufficient tokens receives `429 Too Many Requests`, `Retry-After` rounded up to a positive number of seconds, and JSON `{"error":"rate limit exceeded"}`. No global-quota headers are returned.
 - If all instances for a service are unhealthy, the gateway returns `503 Service Unavailable`. If a selected backend becomes unreachable between probes, the gateway may retry a GET/HEAD request after a gateway-observed pre-header transport failure, subject to normal health and breaker admission.
 - `INTELLIGATE_UPSTREAM_TIMEOUT` configures the maximum upstream request duration using a positive Go duration; it defaults to `5s`. Invalid, zero, or negative values prevent startup.
 - If the upstream deadline expires before response headers arrive, the gateway returns `504 Gateway Timeout` with the plain-text message `upstream request timed out`. Ordinary connection/proxy failures remain `502 Bad Gateway`.
@@ -163,4 +166,4 @@ Administrative paths are provisional and must not be exposed publicly without an
 
 ## Gateway error behavior
 
-The gateway returns `404 Not Found` for an unmapped path, `503 Service Unavailable` when no healthy breaker-admitted instance is available before the first attempt, `502 Bad Gateway` for exhausted ordinary proxy failures, and `504 Gateway Timeout` for upstream or retry-budget expiration before response headers arrive. After a retryable failure, if no backend can be admitted, the last gateway-observed 502/504 is returned. Otherwise, the gateway forwards the backend's response. Application responses do not alter health or count as breaker failures and are never retried. Authentication failure, rate limiting, invalid-request, and other planned error schemas are not implemented.
+The gateway returns `404 Not Found` for an unmapped path, `429 Too Many Requests` when the per-client bucket is empty, `503 Service Unavailable` when no healthy breaker-admitted instance is available before the first attempt, `502 Bad Gateway` for exhausted ordinary proxy failures, and `504 Gateway Timeout` for upstream or retry-budget expiration before response headers arrive. After a retryable failure, if no backend can be admitted, the last gateway-observed 502/504 is returned. Otherwise, the gateway forwards the backend's response. Application responses do not alter health or count as breaker failures and are never retried. Authentication and other planned error schemas are not implemented.

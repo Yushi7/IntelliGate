@@ -1,6 +1,6 @@
 # Testing Strategy
 
-**Status:** Phase 1 includes Go router/proxy tests and pytest service endpoint tests. Phase 2A and 2B include Go Round Robin, active health-check, and gateway integration tests. Phase 3A adds timeout configuration and proxy timeout tests. Phase 3B adds circuit-breaker state, selector, proxy-outcome, and configuration tests. Phase 3C adds controlled retry, deadline, and admission tests.
+**Status:** Phase 1 includes Go router/proxy tests and pytest service endpoint tests. Phase 2A and 2B include Go Round Robin, active health-check, and gateway integration tests. Phase 3A adds timeout configuration and proxy timeout tests. Phase 3B adds circuit-breaker state, selector, proxy-outcome, and configuration tests. Phase 3C adds controlled retry, deadline, and admission tests. Phase 4A adds token-bucket, cleanup, configuration, and gateway-middleware tests.
 
 ## Principles
 
@@ -12,7 +12,7 @@
 
 ## Go unit testing
 
-Use the Go standard `testing` package for gateway packages. Phase 2B tests health-aware selection and probing. Phase 3A tests timeout configuration, timely/timed-out upstreams, 504 mapping, concurrent request handling, and existing error/path behavior. Phase 3B tests breaker defaults and config validation, consecutive failure threshold and reset, cooldown, HALF-OPEN admission limits, successful close, failed reopen, stale permits, cancellation, concurrent outcomes, backend isolation, Round Robin exclusion/re-entry, health-probe independence, and gateway-vs-application response classification. Phase 3C tests GET/HEAD-only retries, bounded attempts, backoff order/cancellation, replayable request bodies, alternate and single-backend selection, health/breaker admission, HALF-OPEN trials, application-status non-retry, body-stream non-retry, client-vs-gateway deadlines, retry-budget timeout, and permit completion. Existing 404, 502, 503, 504, and path/query tests provide regression coverage. Authentication, token-bucket behavior, adaptive scoring, EWMA, and metrics remain planned.
+Use the Go standard `testing` package for gateway packages. Phase 2B tests health-aware selection and probing. Phase 3A tests timeout configuration, timely/timed-out upstreams, 504 mapping, concurrent request handling, and existing error/path behavior. Phase 3B tests breaker defaults and config validation, consecutive failure threshold and reset, cooldown, HALF-OPEN admission limits, successful close, failed reopen, stale permits, cancellation, concurrent outcomes, backend isolation, Round Robin exclusion/re-entry, health-probe independence, and gateway-vs-application response classification. Phase 3C tests GET/HEAD-only retries, bounded attempts, backoff order/cancellation, replayable request bodies, alternate and single-backend selection, health/breaker admission, HALF-OPEN trials, application-status non-retry, body-stream non-retry, client-vs-gateway deadlines, retry-budget timeout, and permit completion. Phase 4A tests token consumption/refill, Retry-After rounding, per-IP separation and IPv4/IPv6 parsing, concurrent capacity, cleanup, environment validation, disabled behavior, health exemption, spoofed forwarding headers, and rejection before routing. Existing 404, 429, 502, 503, 504, and path/query tests provide regression coverage. Authentication, distributed shared quotas, adaptive scoring, EWMA, and metrics remain planned.
 
 ## FastAPI testing with Pytest
 
@@ -188,6 +188,15 @@ go test -count=10 ./internal/proxy
 go test -count=10 ./internal/circuitbreaker
 ```
 
+## Rate-limit testing (implemented in Phase 4A)
+
+The token-bucket tests use an injectable clock for deterministic refill and expiration checks. Concurrent requests share a fixed clock to prove acceptance never exceeds bucket capacity; cleanup and access run concurrently under the limiter's map lock. Gateway tests verify startup configuration, disabled-mode compatibility, `GET /health` exemption, Retry-After/JSON responses, and that rejected requests do not reach the selector. Repeat these tests with:
+
+```powershell
+go test -count=10 ./internal/ratelimit
+go test -count=10 ./cmd/gateway
+```
+
 ## Performance testing
 
 Use Locust for repeatable load generation. Record workload shape, duration, warm-up, concurrency, service configuration, and routing policy. Measure throughput, average/p50/p95/p99 latency, error rate, backend distribution, rate-limit behavior, and recovery time as described in [EXPERIMENTS.md](./EXPERIMENTS.md). Performance results are pending until real experiments are run.
@@ -198,4 +207,4 @@ Inject controlled backend failure, latency, and restart/recovery events in a loc
 
 ## Current status
 
-Phase 1 service tests and Phase 2A/2B/3A/3B/3C Go routing, health-check, timeout, circuit-breaker, retry, and simulated integration tests are implemented. Manual retry verification has not been recorded. Record manual results in [DEVELOPMENT_LOG.md](./DEVELOPMENT_LOG.md) only after running them. Tests for authentication, rate limiting, databases, adaptive routing, and monitoring are not implemented.
+Phase 1 service tests and Phase 2A/2B/3A/3B/3C/4A Go routing, health-check, timeout, circuit-breaker, retry, rate-limit, and simulated integration tests are implemented. Manual rate-limit verification has not been recorded. Record manual results in [DEVELOPMENT_LOG.md](./DEVELOPMENT_LOG.md) only after running them. Tests for authentication, distributed quotas, databases, adaptive routing, and monitoring are not implemented.

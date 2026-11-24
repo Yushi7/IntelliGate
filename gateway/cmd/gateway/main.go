@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -20,11 +21,15 @@ import (
 	"intelligate/gateway/internal/circuitbreaker"
 	"intelligate/gateway/internal/health"
 	"intelligate/gateway/internal/proxy"
+	"intelligate/gateway/internal/ratelimit"
 	"intelligate/gateway/internal/router"
 )
 
 const (
 	upstreamTimeoutEnv                 = "INTELLIGATE_UPSTREAM_TIMEOUT"
+	rateLimitEnabledEnv                = "INTELLIGATE_RATE_LIMIT_ENABLED"
+	rateLimitRateEnv                   = "INTELLIGATE_RATE_LIMIT_RATE"
+	rateLimitBurstEnv                  = "INTELLIGATE_RATE_LIMIT_BURST"
 	breakerFailureThresholdEnv         = "INTELLIGATE_CIRCUIT_BREAKER_FAILURE_THRESHOLD"
 	breakerOpenCooldownEnv             = "INTELLIGATE_CIRCUIT_BREAKER_OPEN_COOLDOWN"
 	breakerHalfOpenMaxRequestsEnv      = "INTELLIGATE_CIRCUIT_BREAKER_HALF_OPEN_MAX_REQUESTS"
@@ -41,6 +46,17 @@ func runGateway() error {
 	upstreamTimeout, err := upstreamTimeoutFromEnv()
 	if err != nil {
 		return err
+	}
+	rateSettings, err := rateLimitSettingsFromEnv()
+	if err != nil {
+		return err
+	}
+	var rateLimiter *ratelimit.Limiter
+	if rateSettings.Enabled {
+		rateLimiter, err = ratelimit.New(rateSettings.Config)
+		if err != nil {
+			return err
+		}
 	}
 	breakerConfig, err := circuitBreakerConfigFromEnv()
 	if err != nil {
@@ -77,11 +93,23 @@ func runGateway() error {
 
 	server := &http.Server{
 		Addr:              ":8080",
-		Handler:           newHandler(products, orders, users),
+		Handler:           newHandlerWithRateLimiter(products, orders, users, rateLimiter),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
 	log.Printf("IntelliGate listening on %s", server.Addr)
+	if rateLimiter != nil {
+		cleanupContext, cancelCleanup := context.WithCancel(ctx)
+		cleanupDone := make(chan struct{})
+		go func() {
+			defer close(cleanupDone)
+			rateLimiter.RunCleanup(cleanupContext)
+		}()
+		defer func() {
+			cancelCleanup()
+			<-cleanupDone
+		}()
+	}
 	return serveWithHealthChecks(ctx, server, checker)
 }
 
@@ -173,6 +201,55 @@ func circuitBreakerConfigFromEnv() (circuitbreaker.Config, error) {
 		return circuitbreaker.Config{}, err
 	}
 	return config, nil
+}
+
+type rateLimitSettings struct {
+	Enabled bool
+	Config  ratelimit.Config
+}
+
+func rateLimitSettingsFromEnv() (rateLimitSettings, error) {
+	settings := rateLimitSettings{
+		Enabled: true,
+		Config:  ratelimit.DefaultConfig(),
+	}
+	if value, configured := os.LookupEnv(rateLimitEnabledEnv); configured {
+		enabled, err := strconv.ParseBool(value)
+		if err != nil {
+			return rateLimitSettings{}, fmt.Errorf("%s must be a boolean: %w", rateLimitEnabledEnv, err)
+		}
+		settings.Enabled = enabled
+	}
+	if !settings.Enabled {
+		return settings, nil
+	}
+
+	rate, err := positiveFloatFromEnv(rateLimitRateEnv, settings.Config.Rate)
+	if err != nil {
+		return rateLimitSettings{}, err
+	}
+	burst, err := positiveFloatFromEnv(rateLimitBurstEnv, settings.Config.Burst)
+	if err != nil {
+		return rateLimitSettings{}, err
+	}
+	settings.Config.Rate = rate
+	settings.Config.Burst = burst
+	return settings, nil
+}
+
+func positiveFloatFromEnv(envName string, defaultValue float64) (float64, error) {
+	value, configured := os.LookupEnv(envName)
+	if !configured {
+		return defaultValue, nil
+	}
+	number, err := strconv.ParseFloat(value, 64)
+	if err != nil || math.IsNaN(number) || math.IsInf(number, 0) || number <= 0 {
+		if err != nil {
+			return 0, fmt.Errorf("%s must be a finite positive number: %w", envName, err)
+		}
+		return 0, fmt.Errorf("%s must be a finite positive number", envName)
+	}
+	return number, nil
 }
 
 func positiveIntFromEnv(envName string, defaultValue int) (int, error) {
@@ -359,6 +436,10 @@ func isHostnameCharacter(character byte) bool {
 }
 
 func newHandler(products, orders, users http.Handler) http.Handler {
+	return newHandlerWithRateLimiter(products, orders, users, nil)
+}
+
+func newHandlerWithRateLimiter(products, orders, users http.Handler, limiter *ratelimit.Limiter) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -372,7 +453,11 @@ func newHandler(products, orders, users http.Handler) http.Handler {
 		router.Route{Prefix: "/api/v1/orders", Handler: orders},
 		router.Route{Prefix: "/api/v1/users", Handler: users},
 	))
-	return requestLogger(mux)
+	var handler http.Handler = mux
+	if limiter != nil {
+		handler = limiter.Middleware(handler)
+	}
+	return requestLogger(handler)
 }
 
 func requestLogger(next http.Handler) http.Handler {

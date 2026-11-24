@@ -16,6 +16,7 @@ import (
 	"intelligate/gateway/internal/circuitbreaker"
 	"intelligate/gateway/internal/health"
 	"intelligate/gateway/internal/proxy"
+	"intelligate/gateway/internal/ratelimit"
 )
 
 func TestHealthReturnsGatewayStatusWithoutProxying(t *testing.T) {
@@ -239,6 +240,147 @@ func TestCircuitBreakerConfigFromEnvRejectsInvalidValues(t *testing.T) {
 				t.Errorf("error %q does not identify %s", err, test.envName)
 			}
 		})
+	}
+}
+
+func TestRateLimitSettingsFromEnvUsesDefaultsWhenUnset(t *testing.T) {
+	unsetEnvironment(t, rateLimitEnabledEnv, rateLimitRateEnv, rateLimitBurstEnv)
+
+	settings, err := rateLimitSettingsFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !settings.Enabled {
+		t.Fatal("rate limiting is disabled by default")
+	}
+	if want := ratelimit.DefaultConfig(); settings.Config != want {
+		t.Fatalf("rate-limit config = %+v, want defaults %+v", settings.Config, want)
+	}
+}
+
+func TestRateLimitSettingsFromEnvAcceptsOverrides(t *testing.T) {
+	t.Setenv(rateLimitEnabledEnv, "true")
+	t.Setenv(rateLimitRateEnv, "12.5")
+	t.Setenv(rateLimitBurstEnv, "30")
+
+	settings, err := rateLimitSettingsFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !settings.Enabled || settings.Config.Rate != 12.5 || settings.Config.Burst != 30 {
+		t.Fatalf("rate-limit settings = %+v, want enabled with rate 12.5 and burst 30", settings)
+	}
+}
+
+func TestRateLimitSettingsFromEnvRejectsInvalidEnabledConfiguration(t *testing.T) {
+	tests := []struct {
+		name    string
+		envName string
+		value   string
+	}{
+		{name: "invalid enabled flag", envName: rateLimitEnabledEnv, value: "sometimes"},
+		{name: "invalid rate", envName: rateLimitRateEnv, value: "fast"},
+		{name: "empty rate", envName: rateLimitRateEnv, value: ""},
+		{name: "zero rate", envName: rateLimitRateEnv, value: "0"},
+		{name: "negative rate", envName: rateLimitRateEnv, value: "-1"},
+		{name: "NaN rate", envName: rateLimitRateEnv, value: "NaN"},
+		{name: "infinite rate", envName: rateLimitRateEnv, value: "+Inf"},
+		{name: "invalid burst", envName: rateLimitBurstEnv, value: "many"},
+		{name: "zero burst", envName: rateLimitBurstEnv, value: "0"},
+		{name: "negative burst", envName: rateLimitBurstEnv, value: "-2"},
+		{name: "infinite burst", envName: rateLimitBurstEnv, value: "Inf"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			unsetEnvironment(t, rateLimitEnabledEnv, rateLimitRateEnv, rateLimitBurstEnv)
+			t.Setenv(rateLimitEnabledEnv, "true")
+			t.Setenv(test.envName, test.value)
+			_, err := rateLimitSettingsFromEnv()
+			if err == nil {
+				t.Fatal("rateLimitSettingsFromEnv() error = nil, want configuration error")
+			}
+			if !strings.Contains(err.Error(), test.envName) {
+				t.Errorf("error %q does not identify %s", err, test.envName)
+			}
+		})
+	}
+}
+
+func TestDisabledRateLimitIgnoresRateValuesAndPreservesHandlerBehavior(t *testing.T) {
+	t.Setenv(rateLimitEnabledEnv, "false")
+	t.Setenv(rateLimitRateEnv, "invalid")
+	t.Setenv(rateLimitBurstEnv, "0")
+	settings, err := rateLimitSettingsFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if settings.Enabled {
+		t.Fatal("rate-limit settings are enabled despite explicit false")
+	}
+
+	var downstreamCalls atomic.Int32
+	backend := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		downstreamCalls.Add(1)
+		w.WriteHeader(http.StatusNoContent)
+	})
+	var limiter *ratelimit.Limiter
+	if settings.Enabled {
+		limiter, err = ratelimit.New(settings.Config)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	handler := newHandlerWithRateLimiter(backend, backend, backend, limiter)
+	for i := 0; i < 2; i++ {
+		recorder := httptest.NewRecorder()
+		request := httptest.NewRequest(http.MethodGet, "/api/v1/products", nil)
+		request.RemoteAddr = "192.0.2.10:1111"
+		handler.ServeHTTP(recorder, request)
+		if recorder.Code != http.StatusNoContent {
+			t.Fatalf("disabled request %d status = %d, want 204", i+1, recorder.Code)
+		}
+	}
+	if downstreamCalls.Load() != 2 {
+		t.Fatalf("downstream calls with limiter disabled = %d, want 2", downstreamCalls.Load())
+	}
+}
+
+func TestRateLimiterRejectsBeforeRoutingAndExemptsGatewayHealth(t *testing.T) {
+	config := ratelimit.DefaultConfig()
+	config.Rate = 0.000001
+	config.Burst = 1
+	limiter, err := ratelimit.New(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var selectorCalls atomic.Int32
+	selector := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		selectorCalls.Add(1)
+		w.WriteHeader(http.StatusOK)
+	})
+	handler := newHandlerWithRateLimiter(selector, http.NotFoundHandler(), http.NotFoundHandler(), limiter)
+	perform := func(path, forwarded string) *httptest.ResponseRecorder {
+		recorder := httptest.NewRecorder()
+		request := httptest.NewRequest(http.MethodGet, path, nil)
+		request.RemoteAddr = "198.51.100.40:1234"
+		request.Header.Set("X-Forwarded-For", forwarded)
+		request.Header.Set("X-Real-IP", forwarded)
+		handler.ServeHTTP(recorder, request)
+		return recorder
+	}
+
+	if response := perform("/api/v1/products", "192.0.2.1"); response.Code != http.StatusOK {
+		t.Fatalf("first request status = %d, want 200", response.Code)
+	}
+	if response := perform("/health", "192.0.2.2"); response.Code != http.StatusOK {
+		t.Fatalf("health status = %d, want 200 despite exhausted bucket", response.Code)
+	}
+	rejected := perform("/api/v1/products", "192.0.2.2")
+	if rejected.Code != http.StatusTooManyRequests {
+		t.Fatalf("second API request status = %d, want 429; forwarded IP must not select a new bucket", rejected.Code)
+	}
+	if selectorCalls.Load() != 1 {
+		t.Fatalf("selector calls = %d, want only the accepted request", selectorCalls.Load())
 	}
 }
 

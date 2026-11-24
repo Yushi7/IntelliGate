@@ -1,6 +1,6 @@
 # IntelliGate Proposed Architecture
 
-**Status:** Phase 1 implements the Go HTTP reverse proxy and three FastAPI services. Phase 2A adds per-service Round Robin pools; Phase 2B adds active health probes and selects only healthy instances; Phase 3A adds configurable upstream request timeouts; Phase 3B adds per-backend circuit breakers; Phase 3C adds bounded retries for eligible upstream transport failures. Authentication, rate limiting, adaptive routing, databases, monitoring, and the other integrations described below remain proposed.
+**Status:** Phase 1 implements the Go HTTP reverse proxy and three FastAPI services. Phase 2A adds per-service Round Robin pools; Phase 2B adds active health probes and selects only healthy instances; Phase 3A adds configurable upstream request timeouts; Phase 3B adds per-backend circuit breakers; Phase 3C adds bounded retries for eligible upstream transport failures; Phase 4A adds an in-memory per-client-IP token bucket. Authentication, distributed rate limiting, adaptive routing, databases, monitoring, and the other integrations described below remain proposed.
 
 ## 1. High-level system architecture
 
@@ -13,7 +13,7 @@ flowchart LR
     Gateway -->|proxy| Product[Product FastAPI Service]
     Gateway -->|proxy| Order[Order FastAPI Service]
     Gateway -->|proxy| User[User FastAPI Service]
-    Gateway <-->|distributed rate-limit state| Redis[(Redis)]
+    Gateway -. planned shared rate-limit state .-> Redis[(Redis)]
     Product --> PostgreSQL[(PostgreSQL)]
     Order --> PostgreSQL
     User --> PostgreSQL
@@ -23,9 +23,9 @@ flowchart LR
     Prometheus -. planned signals .-> Anomaly[Python + scikit-learn anomaly analysis]
 ```
 
-**Status note:** Gateway-to-service HTTP connections, Round Robin selection, active health checks, configurable upstream request timeouts, and per-backend circuit breakers across configured local backend pools are implemented. Redis, PostgreSQL, Prometheus, Grafana, Locust, dashboard, and anomaly-detection connections remain proposed. No containerized deployment is included.
+**Status note:** Gateway-to-service HTTP connections, Round Robin selection, active health checks, configurable upstream request timeouts, per-backend circuit breakers, controlled retries, and in-memory per-IP rate limiting are implemented. Redis, PostgreSQL, Prometheus, Grafana, Locust, dashboard, and anomaly-detection connections remain proposed. No containerized deployment is included.
 
-### Phase 1/3C runtime configuration
+### Phase 1/4A runtime configuration
 
 | Component | Local address | Gateway route |
 | --- | --- | --- |
@@ -41,6 +41,8 @@ The gateway probes each configured backend's `/health` directly with GET request
 Application proxy requests use `INTELLIGATE_UPSTREAM_TIMEOUT`, a positive Go duration parsed at startup. It defaults to `5s`; invalid, zero, or negative values stop startup with an error. The timeout bounds the upstream request using the incoming request context; health probes continue to use their separate 2-second timeout.
 
 Circuit-breaker policy is global and applied independently to every configured backend. Startup accepts `INTELLIGATE_CIRCUIT_BREAKER_FAILURE_THRESHOLD` (`5`), `INTELLIGATE_CIRCUIT_BREAKER_OPEN_COOLDOWN` (`10s`), `INTELLIGATE_CIRCUIT_BREAKER_HALF_OPEN_MAX_REQUESTS` (`1`), and `INTELLIGATE_CIRCUIT_BREAKER_HALF_OPEN_SUCCESS_THRESHOLD` (`1`). All values must be positive; malformed or nonpositive values fail startup.
+
+The in-memory per-client token bucket is enabled by default. `INTELLIGATE_RATE_LIMIT_ENABLED=false` disables it. When enabled, `INTELLIGATE_RATE_LIMIT_RATE` defaults to 10 tokens per second and `INTELLIGATE_RATE_LIMIT_BURST` defaults to a capacity of 20 tokens; malformed, non-finite, zero, or negative values fail startup. Client identity is the canonical IP parsed from `RemoteAddr`; `X-Forwarded-For` and `X-Real-IP` are ignored. Gateway `GET /health` is exempt. Idle buckets expire after 10 minutes and a cleanup loop runs every minute. This quota is local to one gateway process; shared Redis state remains proposed.
 
 ## 2. Component responsibilities
 
@@ -73,7 +75,7 @@ Each service will own its domain API. Service-level validation and persistence d
 
 ### Redis and PostgreSQL
 
-- **Redis:** Shared, short-lived state for distributed token bucket rate limiting. It is not the system of record.
+- **Redis:** Planned shared state for distributed token bucket rate limiting. The implemented Phase 4A limiter is in memory and does not require Redis.
 - **PostgreSQL:** Persistent application records and selected gateway/service configuration. Configuration ownership, schema, and migrations remain implementation decisions.
 
 ### Monitoring and supporting tools
@@ -86,20 +88,20 @@ Each service will own its domain API. Service-level validation and persistence d
 
 ## 3. Request lifecycle
 
-The Phase 3B application request path is:
+The Phase 4A application request path is:
 
 1. Receive an HTTP request at port 8080.
-2. Match the request path to one of the three service prefixes; return 404 if none matches.
-3. Select the next healthy configured instance whose breaker admits a request; return 503 if none is eligible.
-4. Proxy the request with its original path and query; return 502 for ordinary proxy failures or 504 if the upstream deadline expires before response headers.
-5. Log the method and path without query parameters.
+2. Log the method and path, then consume a token from the client's IP bucket; return 429 with `Retry-After` if no token is available. `GET /health` bypasses this limiter.
+3. Match the request path to one of the three service prefixes; return 404 if none matches.
+4. Select the next healthy configured instance whose breaker admits a request; return 503 if none is eligible.
+5. Proxy the request with its original path and query; eligible GET/HEAD transport failures may retry under the bounded Phase 3C policy.
 
 Separately, the health checker probes every configured instance directly at `/health`. The gateway marks all instances unhealthy before the first probe cycle, completes that cycle before accepting application traffic, then starts periodic checks. Probe status changes update the corresponding selector; later successful probes restore eligibility.
 
 The following extended path remains proposed:
 
 1. Handle gateway health/readiness/metrics paths separately from protected service routes.
-2. Validate request metadata, authenticate protected clients, and apply the client's distributed rate limit.
+2. Validate request metadata and authenticate protected clients. The implemented local IP bucket does not provide client identity or cross-gateway shared quotas.
 3. Obtain healthy backends, select an instance using the configured adaptive policy, and proxy the request.
 4. Record request outcome, latency, health, and circuit-breaker signals.
 
@@ -149,7 +151,13 @@ Protected service requests are planned to carry a client API key in the `X-API-K
 
 ## 5. Rate-limiting architecture
 
-The planned policy is a token bucket per client, with Redis holding shared state so multiple gateway instances can enforce a common limit. Refill rate, bucket capacity, key strategy, atomic update mechanism, expiration, and behavior during Redis failure are open implementation decisions. The gateway will return a documented rate-limit response when a request exceeds the configured policy. Exact headers and status/body schema will be set with the API implementation.
+### In-memory token bucket (implemented in Phase 4A)
+
+The gateway uses floating-point token accounting with time-based refill, a default rate of 10 tokens per second, and a burst capacity of 20 tokens. Each accepted request consumes one token. Buckets are keyed by the canonical client IP parsed from the connection's `RemoteAddr`; forwarded-IP headers are not trusted. Bucket operations and cleanup share a short mutex, which is released before downstream routing or proxy execution. Inactive entries expire after 10 minutes; cleanup runs every minute.
+
+When a request has insufficient tokens, the gateway returns HTTP 429 with `{"error":"rate limit exceeded"}` and a positive, rounded-up `Retry-After` value in seconds. No global-quota headers are emitted. `GET /health` is exempt. Configuration uses `INTELLIGATE_RATE_LIMIT_ENABLED` (default `true`), `INTELLIGATE_RATE_LIMIT_RATE` (default `10`), and `INTELLIGATE_RATE_LIMIT_BURST` (default `20`). Rate and burst must be finite positive numbers when enabled.
+
+The limiter is process-local. Shared buckets across gateway instances using Redis, policy administration, and behavior for distributed-state failures remain future work.
 
 ## 6. Routing and load balancing
 
