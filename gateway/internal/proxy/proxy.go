@@ -17,10 +17,28 @@ import (
 const DefaultUpstreamTimeout = 5 * time.Second
 
 var errGatewayUpstreamTimeout = errors.New("gateway upstream timeout")
+var errGatewayRetryBudgetTimeout = errors.New("gateway retry budget exceeded")
 
 type Backend struct {
 	Handler   http.Handler
 	HealthURL *url.URL
+}
+
+type AttemptError struct {
+	StatusCode int
+	Err        error
+}
+
+func (e *AttemptError) Error() string {
+	return e.Err.Error()
+}
+
+func (e *AttemptError) WriteHTTPError(w http.ResponseWriter) {
+	if e.StatusCode == http.StatusGatewayTimeout {
+		http.Error(w, "upstream request timed out", e.StatusCode)
+		return
+	}
+	http.Error(w, "backend service unavailable", e.StatusCode)
 }
 
 func New(target string) (http.Handler, error) {
@@ -55,14 +73,15 @@ func NewBackendWithTimeout(target string, timeout time.Duration) (Backend, error
 	reverseProxy := httputil.NewSingleHostReverseProxy(backend)
 	reverseProxy.Transport = breakerAwareTransport{next: http.DefaultTransport}
 	reverseProxy.ErrorHandler = func(w http.ResponseWriter, req *http.Request, err error) {
-		if isClientContextDone(req.Context()) {
+		if IsClientContextDone(req.Context()) {
 			return
 		}
-		if isGatewayUpstreamTimeout(req.Context()) || isTimeoutError(err) {
-			http.Error(w, "upstream request timed out", http.StatusGatewayTimeout)
-			return
+		attemptErr := newAttemptError(req.Context(), err)
+		if outcome := attemptOutcomeFrom(req.Context()); outcome != nil {
+			outcome.err = attemptErr
+		} else {
+			attemptErr.WriteHTTPError(w)
 		}
-		http.Error(w, "backend service unavailable", http.StatusBadGateway)
 	}
 
 	healthURL := *backend
@@ -73,13 +92,38 @@ func NewBackendWithTimeout(target string, timeout time.Duration) (Backend, error
 	healthURL.Fragment = ""
 	healthURL.RawFragment = ""
 
-	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		ctx, cancel := withUpstreamTimeout(r.Context(), timeout)
-		defer cancel()
-		reverseProxy.ServeHTTP(w, r.WithContext(ctx))
-	})
+	handler := &backendHandler{reverseProxy: reverseProxy, timeout: timeout}
 
 	return Backend{Handler: handler, HealthURL: &healthURL}, nil
+}
+
+type backendHandler struct {
+	reverseProxy *httputil.ReverseProxy
+	timeout      time.Duration
+}
+
+func (h *backendHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	ctx, cancel := withUpstreamTimeout(req.Context(), h.timeout)
+	defer cancel()
+	h.reverseProxy.ServeHTTP(w, req.WithContext(ctx))
+}
+
+func (h *backendHandler) ServeAttempt(w http.ResponseWriter, req *http.Request) *AttemptError {
+	outcome := &attemptOutcome{}
+	ctx := context.WithValue(req.Context(), attemptOutcomeKey{}, outcome)
+	h.ServeHTTP(w, req.WithContext(ctx))
+	return outcome.err
+}
+
+type attemptOutcomeKey struct{}
+
+type attemptOutcome struct {
+	err *AttemptError
+}
+
+func attemptOutcomeFrom(ctx context.Context) *attemptOutcome {
+	outcome, _ := ctx.Value(attemptOutcomeKey{}).(*attemptOutcome)
+	return outcome
 }
 
 type breakerAwareTransport struct {
@@ -93,7 +137,7 @@ func (t breakerAwareTransport) RoundTrip(req *http.Request) (*http.Response, err
 		return response, err
 	}
 	if err != nil {
-		if isClientContextDone(req.Context()) {
+		if IsClientContextDone(req.Context()) {
 			permit.Abandon()
 		} else {
 			permit.Failure()
@@ -126,7 +170,7 @@ func (b observedResponseBody) Read(buffer []byte) (int, error) {
 	}
 	if errors.Is(err, io.EOF) {
 		b.permit.Success()
-	} else if isClientContextDone(b.ctx) {
+	} else if IsClientContextDone(b.ctx) {
 		b.permit.Abandon()
 	} else {
 		b.permit.Failure()
@@ -136,9 +180,9 @@ func (b observedResponseBody) Read(buffer []byte) (int, error) {
 
 func (b observedResponseBody) Close() error {
 	err := b.ReadCloser.Close()
-	if isClientContextDone(b.ctx) {
+	if IsClientContextDone(b.ctx) {
 		b.permit.Abandon()
-	} else if isGatewayUpstreamTimeout(b.ctx) || err != nil {
+	} else if isGatewayTimeoutContext(b.ctx) || err != nil {
 		b.permit.Failure()
 	} else {
 		b.permit.Abandon()
@@ -150,12 +194,29 @@ func withUpstreamTimeout(parent context.Context, timeout time.Duration) (context
 	return context.WithTimeoutCause(parent, timeout, errGatewayUpstreamTimeout)
 }
 
-func isClientContextDone(ctx context.Context) bool {
-	return ctx.Err() != nil && !isGatewayUpstreamTimeout(ctx)
+func WithRetryBudget(parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	return context.WithTimeoutCause(parent, timeout, errGatewayRetryBudgetTimeout)
 }
 
-func isGatewayUpstreamTimeout(ctx context.Context) bool {
-	return errors.Is(context.Cause(ctx), errGatewayUpstreamTimeout)
+func IsClientContextDone(ctx context.Context) bool {
+	return ctx.Err() != nil && !isGatewayTimeoutContext(ctx)
+}
+
+func IsRetryBudgetExceeded(ctx context.Context) bool {
+	return errors.Is(context.Cause(ctx), errGatewayRetryBudgetTimeout)
+}
+
+func isGatewayTimeoutContext(ctx context.Context) bool {
+	return errors.Is(context.Cause(ctx), errGatewayUpstreamTimeout) ||
+		errors.Is(context.Cause(ctx), errGatewayRetryBudgetTimeout)
+}
+
+func newAttemptError(ctx context.Context, err error) *AttemptError {
+	status := http.StatusBadGateway
+	if isGatewayTimeoutContext(ctx) || isTimeoutError(err) {
+		status = http.StatusGatewayTimeout
+	}
+	return &AttemptError{StatusCode: status, Err: err}
 }
 
 func isTimeoutError(err error) bool {

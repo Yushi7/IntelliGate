@@ -179,3 +179,23 @@ This live demonstration is separate from the automated Go tests and is not a per
 - After the cooldown, the HALF-OPEN trial returned HTTP 200.
 - The subsequent product request also returned HTTP 200, confirming recovery.
 - Gateway `GET /health` continued returning HTTP 200.
+
+## Phase 3C controlled upstream retries
+
+**Status:** Implemented and verified with automated Go tests. No commit was created.
+
+### Implemented
+
+- Added a typed retry policy with two retries by default, 100ms/200ms backoffs, and an overall budget derived from the configured upstream timeout and backoff durations.
+- Restricted automatic retries to GET and HEAD requests with replayable bodies, and only to gateway-observed transport errors before response headers are committed. Completed upstream HTTP responses and body-stream failures are not retried.
+- Integrated retries with health-aware Round Robin and per-backend circuit-breaker admission. Each gateway-selected attempt gets a fresh permit; client cancellation/deadline abandons it. The selector prefers a different eligible backend and may reuse an attempted backend only after normal health and breaker checks.
+- Kept successful proxy responses streamed without buffering. Exhausted retries return the last gateway-observed 502/504; no eligible backend before the initial attempt remains 503.
+
+### Verification
+
+- `gofmt` completed for all changed Go files.
+- `go test ./...` from `gateway`: passed for `cmd/gateway`, `internal/balancer`, `internal/circuitbreaker`, `internal/health`, `internal/proxy`, and `internal/router`.
+- `go test -count=10 ./internal/balancer`: passed.
+- `go test -count=10 ./internal/proxy`: passed.
+- `go test -count=10 ./internal/circuitbreaker`: passed.
+- `git diff --check`: passed; Git emitted only Windows line-ending normalization notices. No race-detector, live manual retry, or performance benchmark result is claimed.

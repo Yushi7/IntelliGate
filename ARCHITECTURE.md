@@ -1,6 +1,6 @@
 # IntelliGate Proposed Architecture
 
-**Status:** Phase 1 implements the Go HTTP reverse proxy and three FastAPI services. Phase 2A adds per-service Round Robin pools; Phase 2B adds active health probes and selects only healthy instances; Phase 3A adds configurable upstream request timeouts; Phase 3B adds per-backend circuit breakers. Authentication, rate limiting, adaptive routing, databases, monitoring, and the other integrations described below remain proposed.
+**Status:** Phase 1 implements the Go HTTP reverse proxy and three FastAPI services. Phase 2A adds per-service Round Robin pools; Phase 2B adds active health probes and selects only healthy instances; Phase 3A adds configurable upstream request timeouts; Phase 3B adds per-backend circuit breakers; Phase 3C adds bounded retries for eligible upstream transport failures. Authentication, rate limiting, adaptive routing, databases, monitoring, and the other integrations described below remain proposed.
 
 ## 1. High-level system architecture
 
@@ -25,7 +25,7 @@ flowchart LR
 
 **Status note:** Gateway-to-service HTTP connections, Round Robin selection, active health checks, configurable upstream request timeouts, and per-backend circuit breakers across configured local backend pools are implemented. Redis, PostgreSQL, Prometheus, Grafana, Locust, dashboard, and anomaly-detection connections remain proposed. No containerized deployment is included.
 
-### Phase 1/3B runtime configuration
+### Phase 1/3C runtime configuration
 
 | Component | Local address | Gateway route |
 | --- | --- | --- |
@@ -103,13 +103,21 @@ The following extended path remains proposed:
 3. Obtain healthy backends, select an instance using the configured adaptive policy, and proxy the request.
 4. Record request outcome, latency, health, and circuit-breaker signals.
 
-No application retry policy is configured. The upstream request timeout is configurable as described below; additional middleware and error schemas remain to be defined. Automatic retries are not assumed.
+The gateway applies the controlled retry policy described below after backend selection. It does not infer failures from downstream HTTP status codes.
 
 ### Upstream request timeout (implemented in Phase 3A)
 
 `INTELLIGATE_UPSTREAM_TIMEOUT` accepts a positive Go duration such as `3s` or `1500ms`; if unset, the default is `5s`. Configuration is validated before backend startup. Each proxy request gets a timeout context derived from its incoming request context, so a client cancellation or earlier client deadline is preserved. The timeout cancels the upstream operation and does not hold a shared lock or block other proxy requests.
 
-If the deadline expires before upstream response headers arrive, the gateway returns `504 Gateway Timeout`. Connection and other ordinary proxy failures continue to return `502 Bad Gateway`; no retry is attempted. If the deadline expires after response headers have been sent, the status cannot be changed and the response may be truncated. This keeps the existing streaming proxy behavior without buffering whole responses.
+If the deadline expires before upstream response headers arrive, the gateway observes a `504 Gateway Timeout`; ordinary connection/proxy failures are observed as `502 Bad Gateway`. Eligible GET/HEAD requests may retry these pre-header errors under the Phase 3C policy below. If the deadline expires after response headers have been sent, the status cannot be changed and the response may be truncated. This keeps the existing streaming proxy behavior without buffering whole responses.
+
+### Controlled upstream retries (implemented in Phase 3C)
+
+The gateway allows at most two retries (three gateway-selected attempts total) for GET and HEAD requests. The backoff before the first retry is 100ms and before the second is 200ms. Each attempt goes through the normal health-aware selector and obtains a fresh circuit-breaker permit. The selector prefers an eligible backend not yet attempted; it can reuse an attempted backend only when no different eligible backend is available and the reused backend still passes health and breaker admission.
+
+Only a transport/proxy error reported before response headers are committed is retryable. Completed upstream HTTP responses, including application 4xx/5xx and 502/503/504 responses, are forwarded without retry. A response-body streaming failure after headers is recorded by the breaker but is not retried. GET/HEAD requests with bodies are retried only when `GetBody` can replay the body.
+
+The overall request retry deadline is derived from `(maximum attempts × INTELLIGATE_UPSTREAM_TIMEOUT) + total backoff`; with the default 5-second upstream timeout, the budget is 15.3 seconds. Incoming client cancellation or deadline stops retries without counting as an upstream failure. The upstream response body is streamed and is not buffered for retry.
 
 ```mermaid
 sequenceDiagram
@@ -133,7 +141,7 @@ sequenceDiagram
     P->>G: Scrape metrics endpoint
 ```
 
-The diagram represents intended later-phase interactions except for service-route matching, HTTP proxying, per-service Round Robin selection, active health checking, upstream timeouts, and circuit-breaker admission, which are implemented. The gateway does not retry application requests.
+The diagram represents intended later-phase interactions except for service-route matching, HTTP proxying, per-service Round Robin selection, active health checking, upstream timeouts, circuit-breaker admission, and bounded transport-error retries, which are implemented.
 
 ## 4. API key authentication flow
 
@@ -151,7 +159,7 @@ Each service has its own selector over its configured backend handler list and h
 
 The health checker sends direct GET requests to each backend's `/health` endpoint. It runs the initial probes concurrently before the HTTP server starts, then probes periodically every 5 seconds with a 2-second client timeout. Only 2xx responses are healthy; redirects are not followed. Connection failures, timeouts, and other status codes mark an instance unhealthy. The next successful probe restores it to the round-robin pool. Health is based only on probe outcomes, not ordinary application responses.
 
-If a backend fails after its last successful probe, the attempted request returns 502 or 504. Repeated qualifying failures open that backend's breaker; it is then excluded independently of health state. If no backend is eligible, the route returns 503. There are no retries or automatic failover. Gateway `GET /health` remains a process liveness check and returns 200 regardless of backend health or breaker state.
+If a backend fails after its last successful probe, eligible GET/HEAD requests may retry a bounded number of times through the same health- and breaker-aware selector. Other methods and completed upstream responses are not retried. Repeated qualifying failures open that backend's breaker; it is then excluded independently of health state. If no backend is eligible before the initial attempt, the route returns 503; after a retryable failure, exhaustion or lack of an eligible next backend returns the last gateway-observed 502/504. Gateway `GET /health` remains a process liveness check and returns 200 regardless of backend health or breaker state.
 
 ### Adaptive Least-Loaded
 
@@ -176,9 +184,11 @@ flowchart TD
     RRChoice --> Proxy[Proxy request]
     AdaptiveChoice --> Proxy
     Proxy --> Failure{Backend unavailable?}
-    Failure -->|Timeout before headers| GatewayTimeout[Return 504; no retry]
-    Failure -->|Other proxy error| BadGateway[Return 502; no retry]
+    Failure -->|GET/HEAD transport error before headers; eligible retry| Retry[Back off; select eligible backend; retry]
+    Failure -->|Retries exhausted or ineligible| GatewayError[Return gateway 502 or 504]
+    Failure -->|Response headers/body already started| NoRetry[Do not retry; preserve streamed response]
     Failure -->|No| Response[Return backend response]
+    Retry --> Proxy
 ```
 
 The diagram shows active-health and breaker admission with the implemented Round Robin policy and a proposed adaptive policy. Adaptive scoring is not implemented.
@@ -193,15 +203,15 @@ The initialization rule, alpha, treatment of timeouts/errors, observation window
 
 ## 8. Health monitoring and recovery (implemented in Phase 2B)
 
-The gateway actively probes each configured backend's `/health` endpoint using GET every 5 seconds, with a 2-second timeout and no redirect following. Initial probes run concurrently before application traffic is served. A direct HTTP 2xx response marks the instance healthy; connection errors, timeouts, redirects, and non-2xx statuses mark it unhealthy. Periodic successful probes restore eligibility. Probe outcomes—not application request statuses—control health. All-unhealthy service pools return 503; a backend failure between probes retains the existing 502 behavior. No hysteresis, retries, or health metrics are implemented.
+The gateway actively probes each configured backend's `/health` endpoint using GET every 5 seconds, with a 2-second timeout and no redirect following. Initial probes run concurrently before application traffic is served. A direct HTTP 2xx response marks the instance healthy; connection errors, timeouts, redirects, and non-2xx statuses mark it unhealthy. Periodic successful probes restore eligibility. Probe outcomes—not application request statuses—control health. All-unhealthy service pools return 503; a backend failure between probes retains the existing gateway error/retry behavior. No hysteresis, health-probe retries, or health metrics are implemented.
 
 ## 9. Circuit breaker (implemented in Phase 3B)
 
-Each configured backend instance has an independent breaker; breaker state is separate from the selector's health flag. Round Robin admits only instances that are healthy and whose breaker returns a permit. OPEN instances and HALF-OPEN instances at their trial concurrency limit are skipped. The selector and breaker locks are held only while checking eligibility/reserving a permit, never while proxying. If no instance can be selected, the gateway returns `503 Service Unavailable`; it does not retry.
+Each configured backend instance has an independent breaker; breaker state is separate from the selector's health flag. Round Robin admits only instances that are healthy and whose breaker returns a permit. OPEN instances and HALF-OPEN instances at their trial concurrency limit are skipped. The selector and breaker locks are held only while checking eligibility/reserving a permit, never while proxying. If no instance can be selected before the initial attempt, the gateway returns `503 Service Unavailable`; after a retryable failure, the retry policy returns the last gateway-observed 502/504 if no next instance can be admitted.
 
 The defaults are 5 consecutive qualifying failures, a 10-second OPEN cooldown, one concurrent HALF-OPEN trial, and one successful trial required to close. Startup overrides are `INTELLIGATE_CIRCUIT_BREAKER_FAILURE_THRESHOLD`, `INTELLIGATE_CIRCUIT_BREAKER_OPEN_COOLDOWN`, `INTELLIGATE_CIRCUIT_BREAKER_HALF_OPEN_MAX_REQUESTS`, and `INTELLIGATE_CIRCUIT_BREAKER_HALF_OPEN_SUCCESS_THRESHOLD`. Each must be a positive integer or duration as appropriate.
 
-The proxy observer records upstream transport/request errors and response-body transport errors as failures. Client cancellation abandons a permit rather than failing the backend. A completed upstream HTTP response counts as a transport success regardless of its status, including application 4xx/5xx; an application-generated 502 or 504 is not mistaken for a gateway proxy error. Gateway-generated 502 and 504 correspond to qualifying upstream failures. The proxy uses its existing request-context timeout.
+The proxy observer records upstream transport/request errors and response-body transport errors as failures. Client cancellation abandons a permit rather than failing the backend. A completed upstream HTTP response counts as a transport success regardless of its status, including application 4xx/5xx; an application-generated 502 or 504 is not mistaken for a gateway proxy error. Gateway-generated 502 and 504 correspond to qualifying upstream failures. Each retry attempt obtains and completes its own permit before backoff; the permit's idempotent completion prevents the selector fallback from double-counting an attempt.
 
 After cooldown, an application request may reserve a HALF-OPEN trial; health probes are not trials. A successful health probe updates only the health flag and cannot close an OPEN breaker. A successful complete trial closes after the configured success threshold; a failed trial reopens and restarts cooldown. Permit generations prevent late results from older requests from overriding a newer state transition. Abandoned/canceled trials release their slot without counting success or failure.
 

@@ -108,7 +108,10 @@ func newServiceProxy(envName, defaultURL string, upstreamTimeout time.Duration, 
 		breakers = append(breakers, breaker)
 	}
 
-	selector, err := balancer.NewRoundRobin(backends...)
+	selector, err := balancer.NewRoundRobinWithRetryPolicy(
+		balancer.DefaultRetryPolicy(upstreamTimeout),
+		backends...,
+	)
 	if err != nil {
 		return nil, nil, fmt.Errorf("%s: %w", envName, err)
 	}

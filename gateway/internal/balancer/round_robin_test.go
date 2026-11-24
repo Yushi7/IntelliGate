@@ -283,12 +283,14 @@ func TestRoundRobinRoutesToServiceInstancesAndPreservesPathQuery(t *testing.T) {
 	}
 }
 
-func TestUnavailableBackendReturnsBadGatewayAndSelectionContinues(t *testing.T) {
+func TestUnavailableBackendRetriesOnAvailableInstance(t *testing.T) {
 	unavailable := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
 	unavailableURL := unavailable.URL
 	unavailable.Close()
 
+	var availableRequests atomic.Int32
 	available := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		availableRequests.Add(1)
 		_, _ = fmt.Fprint(w, "available")
 	}))
 	defer available.Close()
@@ -307,16 +309,15 @@ func TestUnavailableBackendReturnsBadGatewayAndSelectionContinues(t *testing.T) 
 	}
 	handler := router.New(router.Route{Prefix: "/api/v1/products", Handler: selector})
 
-	failedRequest := httptest.NewRecorder()
-	handler.ServeHTTP(failedRequest, httptest.NewRequest(http.MethodGet, "/api/v1/products", nil))
-	if failedRequest.Code != http.StatusBadGateway {
-		t.Fatalf("unavailable backend status = %d, want %d", failedRequest.Code, http.StatusBadGateway)
+	for i := 0; i < 2; i++ {
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/v1/products", nil))
+		if recorder.Code != http.StatusOK || recorder.Body.String() != "available" {
+			t.Fatalf("request %d = status %d, body %q; want 200 and available backend", i+1, recorder.Code, recorder.Body.String())
+		}
 	}
-
-	nextRequest := httptest.NewRecorder()
-	handler.ServeHTTP(nextRequest, httptest.NewRequest(http.MethodGet, "/api/v1/products", nil))
-	if nextRequest.Code != http.StatusOK || nextRequest.Body.String() != "available" {
-		t.Fatalf("next request = status %d, body %q; want 200 and available backend", nextRequest.Code, nextRequest.Body.String())
+	if got := availableRequests.Load(); got != 2 {
+		t.Fatalf("available backend received %d requests, want 2", got)
 	}
 }
 
@@ -364,8 +365,8 @@ func TestRoundRobinSkipsOpenBackendAndKeepsBreakersIndependent(t *testing.T) {
 
 	firstRequest := httptest.NewRecorder()
 	selector.ServeHTTP(firstRequest, httptest.NewRequest(http.MethodGet, "/products", nil))
-	if firstRequest.Code != http.StatusBadGateway {
-		t.Fatalf("first request status = %d, want %d", firstRequest.Code, http.StatusBadGateway)
+	if firstRequest.Code != http.StatusOK || firstRequest.Body.String() != "second" {
+		t.Fatalf("first request = status %d, body %q; want 200 from second backend after retry", firstRequest.Code, firstRequest.Body.String())
 	}
 	if got := firstBreaker.State(); got != circuitbreaker.StateOpen {
 		t.Fatalf("first backend breaker state = %s, want open", got)
@@ -381,8 +382,8 @@ func TestRoundRobinSkipsOpenBackendAndKeepsBreakersIndependent(t *testing.T) {
 			t.Fatalf("request to healthy instance = status %d, body %q; want 200 and second", recorder.Code, recorder.Body.String())
 		}
 	}
-	if got := secondRequests.Load(); got != 2 {
-		t.Fatalf("healthy backend received %d requests, want 2", got)
+	if got := secondRequests.Load(); got != 3 {
+		t.Fatalf("healthy backend received %d requests, want 3", got)
 	}
 }
 

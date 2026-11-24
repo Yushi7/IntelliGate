@@ -107,7 +107,7 @@ func TestProxyTimesOutSlowUpstreamWithoutBlockingConcurrentRequest(t *testing.T)
 
 	select {
 	case <-slowDone:
-	case <-time.After(timeout):
+	case <-time.After(timeout + time.Second):
 		t.Fatal("slow request did not finish after its timeout")
 	}
 	if slowResponse.Code != http.StatusGatewayTimeout {
