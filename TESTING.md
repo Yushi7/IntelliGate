@@ -1,6 +1,6 @@
 # Testing Strategy
 
-**Status:** This is a future testing plan. No application tests or runtime components have been created in Phase 0.
+**Status:** Phase 1 includes Go router/proxy tests and pytest health/sample-endpoint tests for each FastAPI service. The broader tests below are planned for later features.
 
 ## Principles
 
@@ -17,6 +17,67 @@ Use the Go standard `testing` package for gateway packages. Planned targets incl
 ## FastAPI testing with Pytest
 
 Use Pytest with FastAPI's test client for each service. Cover endpoint contracts, validation, expected status codes, domain behavior, and persistence interactions. Use isolated test data and a dedicated test database or suitable test doubles; do not point automated tests at production data.
+
+## Phase 1 test commands
+
+Run the gateway tests:
+
+```powershell
+Set-Location gateway
+go test ./...
+Set-Location ..
+```
+
+For each service, create its own virtual environment, install its requirements, and run pytest. From the repository root:
+
+```powershell
+python -m venv services\product-service\.venv
+services\product-service\.venv\Scripts\python.exe -m pip install -r services\product-service\requirements.txt
+services\product-service\.venv\Scripts\python.exe -m pytest services\product-service
+
+python -m venv services\order-service\.venv
+services\order-service\.venv\Scripts\python.exe -m pip install -r services\order-service\requirements.txt
+services\order-service\.venv\Scripts\python.exe -m pytest services\order-service
+
+python -m venv services\user-service\.venv
+services\user-service\.venv\Scripts\python.exe -m pip install -r services\user-service\requirements.txt
+services\user-service\.venv\Scripts\python.exe -m pytest services\user-service
+```
+
+## Manual gateway-to-service integration
+
+1. In three separate PowerShell terminals from the repository root, start the services:
+
+   ```powershell
+   services\product-service\.venv\Scripts\python.exe -m uvicorn main:app --app-dir services\product-service --host 127.0.0.1 --port 8001
+   services\order-service\.venv\Scripts\python.exe -m uvicorn main:app --app-dir services\order-service --host 127.0.0.1 --port 8002
+   services\user-service\.venv\Scripts\python.exe -m uvicorn main:app --app-dir services\user-service --host 127.0.0.1 --port 8003
+   ```
+
+2. In another terminal, start the gateway:
+
+   ```powershell
+   Set-Location gateway
+   go run .\cmd\gateway
+   ```
+
+3. From a fifth terminal, confirm each route returns service-specific JSON:
+
+   ```powershell
+   Invoke-RestMethod http://localhost:8080/api/v1/products
+   Invoke-RestMethod http://localhost:8080/api/v1/orders
+   Invoke-RestMethod http://localhost:8080/api/v1/users
+   ```
+
+4. Confirm service root and health endpoints directly, and verify an unmapped gateway path returns 404:
+
+   ```powershell
+   Invoke-RestMethod http://localhost:8001/
+   Invoke-RestMethod http://localhost:8001/health
+   try { Invoke-WebRequest http://localhost:8080/not-a-service } catch { [int]$_.Exception.Response.StatusCode }
+   ```
+
+5. Stop one service with `Ctrl+C`, request its gateway route, and verify the response status is 502. Restart the service afterward. The Go proxy test separately verifies preservation of the original path and query string.
 
 ## Integration testing
 
@@ -52,4 +113,4 @@ Inject controlled backend failure, latency, and restart/recovery events in a loc
 
 ## Current status
 
-No test suites, test fixtures, CI workflows, or performance tests are implemented. The appropriate checks will be added with their corresponding features.
+Phase 1 unit and service endpoint tests are implemented. The manual integration procedure above exercises live local routing; record its result in [DEVELOPMENT_LOG.md](./DEVELOPMENT_LOG.md) only after running it. Tests for authentication, rate limiting, databases, dynamic routing, monitoring, and resilience are not implemented.

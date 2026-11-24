@@ -2,9 +2,9 @@
 
 **An Adaptive and Intelligent API Gateway for Secure and Dynamic Microservices Traffic Management**
 
-IntelliGate is a proposed API gateway and demonstration environment for routing traffic to an e-commerce application's Product, Order, and User services. The project is intended to explore secure client access, traffic management, service resilience, and observability in a modular microservices system.
+IntelliGate is an API gateway and demonstration environment for routing traffic to an e-commerce application's Product, Order, and User services. The project is being built to explore secure client access, traffic management, service resilience, and observability in a modular microservices system.
 
-> **Phase 0 status:** Project structure and planning documentation are being established. No gateway, service, dashboard, monitoring configuration, or runnable deployment has been implemented yet. All runtime features below are **planned** unless explicitly marked otherwise.
+> **Phase 1 status:** The Go gateway and three FastAPI demonstration services are implemented with static HTTP reverse-proxy routing. Authentication, rate limiting, load balancing, persistence, monitoring, dashboard, and deployment features remain planned.
 
 ## Problem
 
@@ -22,7 +22,8 @@ Microservice applications need a consistent entry point to authenticate clients,
 
 | Capability | Status |
 | --- | --- |
-| Phase 0 project structure and documentation | Implemented in this initialization phase |
+| Go gateway with static service routing and reverse proxy | Implemented in Phase 1 |
+| Gateway and service tests | Implemented in Phase 1 |
 | API key authentication | Planned |
 | Per-client token bucket rate limiting backed by Redis | Planned |
 | Round Robin baseline routing | Planned |
@@ -32,14 +33,14 @@ Microservice applications need a consistent entry point to authenticate clients,
 | Circuit breaker | Planned |
 | Prometheus metrics and Grafana dashboards | Planned |
 | Traffic anomaly detection using Python and scikit-learn | Planned |
-| Product, Order, and User FastAPI services | Planned |
+| Product, Order, and User FastAPI services | Implemented in Phase 1 |
 | React + TypeScript dashboard | Planned |
 | Docker Compose demonstration environment | Planned |
 | Locust performance experiments | Planned |
 
-## Proposed architecture
+## Architecture
 
-Clients send requests to a Go gateway, which is intended to authenticate, apply rate limits, select a healthy backend, and proxy requests. The Product, Order, and User services will be implemented in Python with FastAPI. Redis is designated for distributed rate-limit state; PostgreSQL for persistent records and configuration; Prometheus and Grafana for metrics and visualization. Locust will generate controlled workloads. See [ARCHITECTURE.md](./ARCHITECTURE.md) for proposed flows and component responsibilities.
+Clients send service requests to the Go gateway on port 8080. It statically routes the three service prefixes to FastAPI backends on ports 8001–8003 and preserves the request path and query. This phase does not authenticate, rate-limit, balance, or persist requests. Redis is designated for distributed rate-limit state; PostgreSQL for persistent records and configuration; Prometheus and Grafana for metrics and visualization. These integrations remain planned. See [ARCHITECTURE.md](./ARCHITECTURE.md) for current and proposed behavior.
 
 ## Technology stack
 
@@ -67,18 +68,19 @@ The stack is fixed for this project; any proposed change requires technical just
 ```text
 IntelliGate/
 ├── gateway/
-│   ├── cmd/
+│   ├── go.mod
+│   ├── cmd/gateway/main.go
 │   └── internal/
-│       ├── proxy/
-│       ├── router/
-│       ├── middleware/
-│       ├── health/
-│       ├── circuitbreaker/
-│       └── metrics/
+│       ├── proxy/      # implemented
+│       ├── router/     # implemented
+│       ├── middleware/ # planned
+│       ├── health/     # planned
+│       ├── circuitbreaker/ # planned
+│       └── metrics/    # planned
 ├── services/
-│   ├── product-service/
-│   ├── order-service/
-│   └── user-service/
+│   ├── product-service/{main.py,requirements.txt,test_main.py}
+│   ├── order-service/{main.py,requirements.txt,test_main.py}
+│   └── user-service/{main.py,requirements.txt,test_main.py}
 ├── dashboard/
 ├── monitoring/
 │   ├── prometheus/
@@ -96,29 +98,59 @@ IntelliGate/
 └── API_DOCUMENTATION.md
 ```
 
-The directories are intentionally empty at Phase 0; no placeholder source or configuration files have been added. `docker-compose.yml` will be introduced when a verified runnable local environment is designed, rather than as an empty placeholder.
+Phase 0 created the directory structure; Phase 1 adds gateway and service source under those directories. `docker-compose.yml` remains deferred until a verified containerized environment is designed.
 
 ## Development roadmap
 
 | Phase | Scope | Status |
 | --- | --- | --- |
-| 0 | Initialize structure, scope, architecture, API plan, and verification strategy | Complete; awaiting review |
-| 1 | Implement the foundational Go gateway and service communication | Pending developer review and explicit approval |
-| Later | Add authentication, rate limiting, routing algorithms, health/resilience, metrics, and services | Pending |
+| 0 | Initialize structure, scope, architecture, API plan, and verification strategy | Complete |
+| 1 | Implement the foundational Go gateway and service communication | Implemented; automated tests included |
+| Later | Add authentication, rate limiting, routing algorithms, health/resilience, and metrics | Pending |
 | Later | Add dashboard, anomaly detection, load experiments, and deployment automation | Pending |
 
-No Phase 1 work should begin until Phase 0 has been reviewed and explicitly approved.
+Phase 1 implementation was approved and is recorded below. Later-phase work remains pending.
+
+## Run locally
+
+Open separate PowerShell terminals from the repository root.
+
+```powershell
+python -m venv services\product-service\.venv
+services\product-service\.venv\Scripts\Activate.ps1
+python -m pip install -r services\product-service\requirements.txt
+python -m uvicorn main:app --app-dir services\product-service --host 127.0.0.1 --port 8001
+```
+
+Repeat in separate terminals for Order (`services\order-service`, port `8002`) and User (`services\user-service`, port `8003`), using each service's own `.venv` and requirements file. Start the gateway in another terminal:
+
+```powershell
+Set-Location gateway
+go run .\cmd\gateway
+```
+
+The gateway listens on `http://localhost:8080`. Example: `Invoke-RestMethod http://localhost:8080/api/v1/products`.
+
+## Run tests
+
+```powershell
+Set-Location gateway
+go test ./...
+Set-Location ..
+```
+
+For each service, install its requirements in that service's virtual environment, then run `python -m pytest services\<service-folder>` from the repository root. See [TESTING.md](./TESTING.md) for the complete service commands and manual integration checks.
 
 ## Prerequisites
 
-For future development and execution, install compatible versions of Go, Python, Node.js, Docker with Docker Compose, PostgreSQL, Redis, and Locust. Git and a GitHub account are needed for collaboration and CI/CD. Exact supported versions, environment variables, and commands have not yet been established and will be documented alongside the relevant implementation.
+For Phase 1, install Go and Python. Node.js, Docker, PostgreSQL, Redis, and Locust are not required to run the current gateway and services.
 
 ## Future execution
 
-**There is currently no executable application or deployment setup.** Once later phases add the implementation and verified configuration, this section will provide exact setup, environment configuration, startup, and test commands. Do not expect `docker compose up` or service-specific run commands to work in Phase 0.
+There is no Docker deployment configuration. Run the gateway and services directly as described below.
 
 ## Current implementation status
 
-- **Implemented:** Phase 0 directory structure and planning documents.
-- **Not implemented:** All application logic and runtime configuration, including the Go gateway, FastAPI services, React dashboard, database/cache integration, monitoring stack, load tests, and CI/CD workflows.
-- **Verification:** Phase 0 contents and status are recorded in [DEVELOPMENT_LOG.md](./DEVELOPMENT_LOG.md). Planned tests and experiment result tables are intentionally pending.
+- **Implemented:** Phase 1 static Go reverse proxy, three FastAPI services, and focused unit/endpoint tests.
+- **Not implemented:** Authentication, rate limiting, dynamic/load-balanced routing, health-based backend selection, circuit breaking, database/cache integration, monitoring, dashboard, load tests, Docker configuration, and CI/CD workflows.
+- **Verification:** Current test and manual integration procedures are recorded in [TESTING.md](./TESTING.md); actual run results are recorded in [DEVELOPMENT_LOG.md](./DEVELOPMENT_LOG.md).

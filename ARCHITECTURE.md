@@ -1,10 +1,10 @@
 # IntelliGate Proposed Architecture
 
-**Status:** This document describes the target design. At Phase 0, the directories and documentation are initialized; the runtime components and integrations below are **proposed, not implemented**.
+**Status:** Phase 1 implements a static Go HTTP reverse proxy and three FastAPI services. Authentication, rate limiting, dynamic backend selection, databases, monitoring, and the other integrations described below remain proposed.
 
 ## 1. High-level system architecture
 
-The Go gateway will be the only public entry point for client API traffic. It will apply request policies and proxy service requests using Go's standard HTTP reverse-proxy capabilities. Python FastAPI services will own their respective domain APIs. Redis will hold distributed rate-limit state; PostgreSQL will hold persistent application data and selected configuration. Prometheus will scrape metrics, and Grafana will visualize them. Locust will generate workloads. The dashboard and anomaly-detection component are planned consumers of system data.
+The Go gateway is the public entry point for client API traffic. In Phase 1, it statically proxies requests to the three Python FastAPI services using Go's standard HTTP reverse-proxy capabilities. Future phases may add gateway policies and service-owned domain APIs. Redis is designated for distributed rate-limit state; PostgreSQL for persistent application data and selected configuration. Prometheus/Grafana, Locust, the dashboard, and anomaly-detection component remain planned.
 
 ```mermaid
 flowchart LR
@@ -23,15 +23,28 @@ flowchart LR
     Prometheus -. planned signals .-> Anomaly[Python + scikit-learn anomaly analysis]
 ```
 
-**Status note:** All runtime nodes and connections in this diagram are proposed. The diagram does not imply a deployed or operational system.
+**Status note:** The gateway-to-service HTTP connections are implemented for the three configured local backends. Redis, PostgreSQL, Prometheus, Grafana, Locust, dashboard, and anomaly-detection connections remain proposed. No containerized deployment is included.
+
+### Phase 1 runtime configuration
+
+| Component | Local address | Gateway route |
+| --- | --- | --- |
+| Gateway | `http://localhost:8080` | Entry point |
+| Product Service | `http://localhost:8001` | `/api/v1/products` and descendants |
+| Order Service | `http://localhost:8002` | `/api/v1/orders` and descendants |
+| User Service | `http://localhost:8003` | `/api/v1/users` and descendants |
+
+The gateway keeps the incoming path and query string unchanged when proxying. Each service also exposes `GET /` and `GET /health` directly on its local port.
 
 ## 2. Component responsibilities
 
 ### Gateway (Go)
 
-The gateway is planned to:
+Beyond the Phase 1 behavior below, the gateway is planned to:
 
-- Expose public HTTP endpoints and route service paths.
+- Expose a public HTTP entry point and statically route the three service prefixes (implemented).
+- Log each request method and path, without query parameters (implemented).
+- Return `404 Not Found` for unmatched paths and `502 Bad Gateway` when a backend cannot be reached (implemented).
 - Authenticate protected clients and apply per-client rate limits.
 - Select eligible backend instances using the configured balancing policy.
 - Reverse-proxy requests and responses with appropriate timeouts and error handling.
@@ -39,13 +52,13 @@ The gateway is planned to:
 - Expose health, readiness, and Prometheus metrics endpoints.
 - Exclude unhealthy or open-circuit instances and support controlled recovery.
 
-The intended package boundaries are `proxy`, `router`, `middleware`, `health`, `circuitbreaker`, and `metrics` under `gateway/internal/`. These are planned boundaries, not implemented packages.
+The `proxy` and `router` packages under `gateway/internal/` are implemented. The `middleware`, `health`, `circuitbreaker`, and `metrics` directories remain planned boundaries.
 
 ### Backend microservices (Python + FastAPI)
 
-- **Product Service:** Planned product catalog operations.
-- **Order Service:** Planned order creation and retrieval operations.
-- **User Service:** Planned user profile operations.
+- **Product Service:** Sample catalog GET endpoint implemented; broader catalog operations remain planned.
+- **Order Service:** Sample orders GET endpoint implemented; order creation and retrieval remain planned.
+- **User Service:** Sample users GET endpoint implemented; profile operations remain planned.
 
 Each service will own its domain API. Service-level validation and persistence details remain to be designed with implementation. Backend services are not intended to replace gateway authentication and traffic policy.
 
@@ -64,20 +77,21 @@ Each service will own its domain API. Service-level validation and persistence d
 
 ## 3. Request lifecycle
 
-The intended request path is:
+The Phase 1 request path is:
 
-1. Receive an HTTP request at the gateway.
-2. Handle gateway health/readiness/metrics paths separately from protected service routes.
-3. Resolve the service route and validate required request metadata.
-4. Authenticate the client for protected routes.
-5. Apply the client's distributed rate limit using Redis.
-6. Obtain the eligible healthy backend set; exclude instances disallowed by health or circuit-breaker state.
-7. Select an instance with the configured Round Robin or Adaptive Least-Loaded policy.
-8. Proxy the request using Go's standard HTTP reverse-proxy capabilities, enforcing timeouts.
-9. Record request outcome and latency; update EWMA and health/circuit-breaker signals as appropriate.
-10. Return the backend response or a gateway error response.
+1. Receive an HTTP request at port 8080.
+2. Match the request path to one of the three service prefixes; return 404 if none matches.
+3. Proxy the request with its original path and query to the mapped service; return 502 if the backend is unavailable.
+4. Log the method and path without query parameters.
 
-The precise middleware order, error schema, timeout values, and retry policy must be defined and tested during implementation. Automatic retries are not assumed by this proposal.
+The following extended path remains proposed:
+
+1. Handle gateway health/readiness/metrics paths separately from protected service routes.
+2. Validate request metadata, authenticate protected clients, and apply the client's distributed rate limit.
+3. Obtain eligible backends, select an instance using the configured policy, and proxy the request.
+4. Record request outcome, latency, health, and circuit-breaker signals.
+
+No retry policy or explicit upstream timeout is configured in Phase 1. Additional middleware, error schemas, and timeout policy remain to be defined. Automatic retries are not assumed.
 
 ```mermaid
 sequenceDiagram
@@ -101,7 +115,7 @@ sequenceDiagram
     P->>G: Scrape metrics endpoint
 ```
 
-The diagram represents intended interactions, not verified behavior.
+The diagram represents intended later-phase interactions except for service-route matching and HTTP proxying, which are implemented in Phase 1.
 
 ## 4. API key authentication flow
 

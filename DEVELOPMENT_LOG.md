@@ -39,11 +39,26 @@ Go; Python + FastAPI; React + TypeScript; Tailwind CSS; PostgreSQL; Redis; Prome
 
 ### Pending implementation tasks
 
-- Obtain developer review and explicit approval before starting Phase 1.
-- Define project dependency versions and local environment configuration.
-- Implement the Go gateway and service routing/proxy foundation.
-- Implement the three FastAPI services and their API contracts.
+- Phase 1 gateway, service, and foundational routing implementation is complete.
 - Design and test authentication, rate limiting, balancing, health checks, circuit breaking, and recovery.
 - Add database/cache integrations, metrics, dashboards, CI, and container orchestration when justified by working components.
 - Add Locust scenarios and conduct experiments; populate results only from actual runs.
 - Evaluate and document anomaly-detection design using suitable data.
+
+## 2026-11-24 — Phase 1 gateway and service foundation
+
+**Status:** Implemented and verified locally.
+
+### Implemented
+
+- Added a Go standard-library HTTP gateway on port `8080`, with static Product (`8001`), Order (`8002`), and User (`8003`) routing.
+- Added path-boundary-aware route matching, unchanged path/query proxying, request logging, `404` for unmapped paths, and `502` for unavailable backends.
+- Added separate FastAPI applications, sample GET endpoints, root and health endpoints, requirements, and pytest tests for each service.
+- Updated the README, architecture, API, and testing documentation to separate Phase 1 behavior from planned features. No database, Redis, Docker, authentication, load balancing, or advanced monitoring was added.
+
+### Verification
+
+- `go test ./...` from `gateway`: passed for router and proxy packages.
+- Pytest in each service's own virtual environment: Product `2 passed`, Order `2 passed`, User `2 passed`. Each run emitted a Starlette deprecation warning about its current `httpx` test-client integration; no tests failed.
+- Manual local integration: all three gateway routes returned the expected service-specific sample data; Product root and health returned successfully; an unmapped gateway path returned `404`; stopping Product Service caused its gateway route to return `502`.
+- The Go proxy test verified path and query preservation. No performance or broader resilience results are claimed.
