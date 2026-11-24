@@ -233,7 +233,7 @@ This live demonstration is separate from the automated Go tests and is not a per
 - Authentication is enabled by default through `INTELLIGATE_AUTH_ENABLED`; when enabled, missing or empty key configuration prevents startup. Explicit `INTELLIGATE_AUTH_ENABLED=false` disables authentication.
 - Protected `/api/v1` and all `/api/v1/*` paths with the `X-API-Key` header, including future/unmapped routes. Missing, invalid, repeated, and comma-combined key values return the same `401` JSON response: `{"error":"unauthorized"}`.
 - Stored SHA-256 key digests and compared fixed-size digests with `crypto/subtle`. Validated keys are stripped before upstream proxying. Middleware order is logging → authentication → rate limiting → routing/proxy. Unauthorized requests do not consume limiter tokens or reach backends. Gateway `GET /health` remains public.
-- Updated README, architecture, API, and testing docs with configuration, middleware order, local placeholder-key instructions, and shared-key security limitations. Keys are not distributed; JWTs, roles, per-key policies, and automatic rotation/revocation are not implemented.
+- Updated README, architecture, API, and testing docs with configuration, middleware order, local placeholder-key instructions, and shared-key security limitations. Role authorization was not part of Phase 4B.1 and is implemented in Phase 4B.2 below.
 
 ### Automated verification
 
@@ -255,8 +255,37 @@ This live demonstration is separate from the automated Go tests and is not a per
 
 ### Limitations
 
-- Shared API keys only; JWT and role-based authorization are not implemented.
+- Shared API keys only in this phase; role-based authorization is added in Phase 4B.2 below.
 - Configuration changes require a gateway restart.
 - Direct microservice ports are not protected by gateway authentication.
 - TLS and protected secret management are required for exposed deployments.
 - There is no distributed authentication or key-rotation service.
+
+## Phase 4B.2 role-based access control
+
+**Status:** Implemented and verified with automated Go tests. No commit was created.
+
+### Implemented
+
+- Added the `admin`, `read`, and `write` roles. `admin` and `write` allow GET, HEAD, POST, PUT, PATCH, and DELETE; `read` allows GET and HEAD only. Unsupported methods are rejected with HTTP 403.
+- Added `INTELLIGATE_API_KEY_ROLES` as a JSON key-to-role mapping. Malformed JSON, empty or duplicate/ambiguous keys, and unknown roles fail startup without exposing credentials. Setting this variable together with `INTELLIGATE_API_KEYS` is rejected as ambiguous.
+- Preserved legacy `INTELLIGATE_API_KEYS`; those keys continue to receive `admin` access. Migrate to the JSON role mapping for least-privilege keys.
+- Authentication runs before authorization; authenticated role data is attached to a private request-context key. Roles supplied in headers or query parameters are ignored. API keys and known role-assertion headers are stripped before proxying.
+- Middleware order is request logging → authentication → authorization → rate limiting → routing/backend selection/retries/proxy. Missing or invalid keys return 401; authenticated requests without permission return 403. Unauthorized and forbidden requests do not consume limiter tokens or reach upstreams. Public `GET /health` remains accessible.
+- Updated README, architecture, API, and testing documentation with the role matrix, configuration, migration behavior, middleware order, and limitations.
+
+### Automated verification
+
+- `gofmt` completed for all changed Go files.
+- `go test ./...` from `gateway`: passed for `cmd/gateway`, `internal/auth`, `internal/balancer`, `internal/circuitbreaker`, `internal/health`, `internal/proxy`, `internal/ratelimit`, and `internal/router`.
+- `go test -count=10 ./internal/auth`: passed.
+- `go test -count=10 ./cmd/gateway`: passed.
+- Tests cover method permissions for each role, legacy admin compatibility, malformed/unknown/duplicate role configuration, conflicting configuration variables, spoofed role headers/query parameters, unauthorized/forbidden limiter ordering, upstream metadata stripping, and concurrent role isolation.
+- No live manual RBAC test, race-detector run, or performance benchmark is claimed.
+
+### Limitations
+
+- Shared API keys only; no JWT, OAuth, or database-backed identity.
+- Configuration changes require restarting the gateway; there is no distributed authentication or key-rotation service.
+- Direct microservice ports bypass gateway authentication and authorization.
+- TLS and protected secret management are required for exposed deployments.

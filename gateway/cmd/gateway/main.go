@@ -29,6 +29,7 @@ import (
 const (
 	authEnabledEnv                     = "INTELLIGATE_AUTH_ENABLED"
 	apiKeysEnv                         = "INTELLIGATE_API_KEYS"
+	apiKeyRolesEnv                     = "INTELLIGATE_API_KEY_ROLES"
 	upstreamTimeoutEnv                 = "INTELLIGATE_UPSTREAM_TIMEOUT"
 	rateLimitEnabledEnv                = "INTELLIGATE_RATE_LIMIT_ENABLED"
 	rateLimitRateEnv                   = "INTELLIGATE_RATE_LIMIT_RATE"
@@ -135,23 +136,47 @@ func authenticationSettingsFromEnv() (authenticationSettings, error) {
 		settings.Enabled = enabled
 	}
 
-	value, configured := os.LookupEnv(apiKeysEnv)
-	if !configured {
+	keyList, keysConfigured := os.LookupEnv(apiKeysEnv)
+	roleMapping, rolesConfigured := os.LookupEnv(apiKeyRolesEnv)
+	if keysConfigured && rolesConfigured {
+		return authenticationSettings{}, fmt.Errorf("%s and %s cannot both be set", apiKeysEnv, apiKeyRolesEnv)
+	}
+	if !keysConfigured && !rolesConfigured {
 		if settings.Enabled {
-			return authenticationSettings{}, fmt.Errorf("%s must be set when authentication is enabled", apiKeysEnv)
+			return authenticationSettings{}, fmt.Errorf("either %s or %s must be set when authentication is enabled", apiKeysEnv, apiKeyRolesEnv)
 		}
 		return settings, nil
 	}
-	keys, err := auth.ParseKeys(value)
-	if err != nil {
-		return authenticationSettings{}, fmt.Errorf("%s: %w", apiKeysEnv, err)
+
+	var keys []string
+	var roles map[string]auth.Role
+	var err error
+	if rolesConfigured {
+		roles, err = auth.ParseRoleMapping(roleMapping)
+		if err != nil {
+			return authenticationSettings{}, fmt.Errorf("%s: %w", apiKeyRolesEnv, err)
+		}
+	} else {
+		keys, err = auth.ParseKeys(keyList)
+		if err != nil {
+			return authenticationSettings{}, fmt.Errorf("%s: %w", apiKeysEnv, err)
+		}
 	}
 	if !settings.Enabled {
 		return settings, nil
 	}
-	settings.Authenticator, err = auth.New(keys)
+
+	if rolesConfigured {
+		settings.Authenticator, err = auth.NewWithRoles(roles)
+	} else {
+		settings.Authenticator, err = auth.New(keys)
+	}
 	if err != nil {
-		return authenticationSettings{}, fmt.Errorf("%s: %w", apiKeysEnv, err)
+		configuredEnv := apiKeysEnv
+		if rolesConfigured {
+			configuredEnv = apiKeyRolesEnv
+		}
+		return authenticationSettings{}, fmt.Errorf("%s: %w", configuredEnv, err)
 	}
 	return settings, nil
 }
@@ -509,7 +534,8 @@ func newHandlerWithAuthentication(
 		handler = limiter.Middleware(handler)
 	}
 	if authenticator != nil {
-		handler = authenticator.Middleware(handler)
+		handler = authenticator.AuthorizationMiddleware(handler)
+		handler = authenticator.AuthenticationMiddleware(handler)
 	}
 	return requestLogger(handler)
 }

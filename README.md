@@ -4,7 +4,7 @@
 
 IntelliGate is an API gateway and demonstration environment for routing traffic to an e-commerce application's Product, Order, and User services. The project is being built to explore secure client access, traffic management, service resilience, and observability in a modular microservices system.
 
-> **Phase 4B.1 status:** The Go gateway and three FastAPI demonstration services are implemented. The gateway uses configurable per-service Round Robin pools, active health checks, upstream request timeouts, per-backend circuit breakers, bounded retries for eligible GET/HEAD transport failures, API-key authentication, and an in-memory per-client-IP token bucket. Distributed rate-limit storage, JWT/role-based authorization, adaptive routing, persistence, monitoring, dashboard, and deployment features remain planned.
+> **Phase 4B.2 status:** The Go gateway and three FastAPI demonstration services are implemented. The gateway uses configurable per-service Round Robin pools, active health checks, upstream request timeouts, per-backend circuit breakers, bounded retries for eligible GET/HEAD transport failures, API-key authentication with role-based access control, and an in-memory per-client-IP token bucket. JWT/OAuth, distributed authentication/rate-limit storage, adaptive routing, persistence, monitoring, dashboard, and deployment features remain planned.
 
 ## Problem
 
@@ -30,6 +30,7 @@ Microservice applications need a consistent entry point to authenticate clients,
 | Bounded retries for eligible GET/HEAD transport failures | Implemented in Phase 3C |
 | In-memory per-client-IP token bucket rate limiting | Implemented in Phase 4A |
 | API key authentication for `/api/v1/*` | Implemented in Phase 4B.1 |
+| API-key role-based access control | Implemented in Phase 4B.2 |
 | Gateway and service tests | Implemented in Phase 1 |
 | Shared/distributed rate limiting backed by Redis | Planned |
 | Round Robin baseline routing | Implemented in Phase 2A |
@@ -48,7 +49,7 @@ Microservice applications need a consistent entry point to authenticate clients,
 
 ## Architecture
 
-Clients send service requests to the Go gateway on port 8080. The gateway authenticates every `/api/v1/*` request with `X-API-Key` before applying rate limits or routing. `INTELLIGATE_API_KEYS` supplies comma-separated keys; authentication is enabled by default, and startup fails if enabled without valid keys. Only `GET /health` is public. The key is removed before proxying and is not logged. Then an in-memory token bucket applies per-client-IP limits: 10 tokens/second with a capacity of 20 by default. `INTELLIGATE_RATE_LIMIT_ENABLED=false` disables rate limiting; `INTELLIGATE_RATE_LIMIT_RATE` and `INTELLIGATE_RATE_LIMIT_BURST` override positive values. Client identity comes from the parsed `RemoteAddr`; forwarded-IP headers are not trusted. `GET /health` is also exempt from rate limiting. Inactive buckets expire after 10 minutes and are cleaned every minute. A rejected request receives 429 with `Retry-After`; the quota is process-local, not shared across gateway instances.
+Clients send service requests to the Go gateway on port 8080. The gateway authenticates every `/api/v1/*` request with `X-API-Key`, authorizes its configured role, then applies rate limits and routing. Use either `INTELLIGATE_API_KEY_ROLES` as a JSON key-to-role object, or legacy comma-separated `INTELLIGATE_API_KEYS`; these variables cannot be set together. Legacy keys receive the `admin` role. Authentication is enabled by default, and startup fails if enabled without valid configuration. `admin` and `write` may use GET, HEAD, POST, PUT, PATCH, and DELETE; `read` may use only GET and HEAD. Denied methods return 403; unauthenticated requests return 401. Only `GET /health` is public. Credentials and role metadata are removed before proxying and roles are never accepted from client headers or query parameters. Then an in-memory token bucket applies per-client-IP limits: 10 tokens/second with a capacity of 20 by default. `INTELLIGATE_RATE_LIMIT_ENABLED=false` disables rate limiting; `INTELLIGATE_RATE_LIMIT_RATE` and `INTELLIGATE_RATE_LIMIT_BURST` override positive values. Client identity comes from the parsed `RemoteAddr`; forwarded-IP headers are not trusted. `GET /health` is also exempt from rate limiting. Inactive buckets expire after 10 minutes and are cleaned every minute. A rejected request receives 429 with `Retry-After`; the quota is process-local, not shared across gateway instances.
 
 The gateway round-robins among configured instances that pass direct `/health` checks and have an available circuit-breaker permit. Breakers are per instance: after 5 qualifying transport failures, an instance is excluded for a 10-second cooldown before a half-open trial is allowed. A failed trial reopens it; the configured number of complete upstream responses closes it. Configure thresholds with the `INTELLIGATE_CIRCUIT_BREAKER_*` environment variables. A 5-second upstream timeout is the default (`INTELLIGATE_UPSTREAM_TIMEOUT` overrides it); GET and HEAD requests retry eligible pre-header transport failures up to twice, with 100ms and 200ms backoffs. The overall retry budget is `(3 × upstream timeout) + 300ms` (15.3 seconds by default). GET/HEAD bodies require `GetBody` for replay. Completed application responses and response-body streaming failures are not retried. Timeout before headers returns 504, exhausted ordinary proxy failures return 502, and no initially eligible backend returns 503. Gateway `GET /health` remains independent of backend state. Distributed Redis rate limiting, PostgreSQL, Prometheus, and Grafana integrations remain planned. See [ARCHITECTURE.md](./ARCHITECTURE.md) for details.
 
@@ -82,7 +83,7 @@ IntelliGate/
 │   ├── cmd/gateway/main.go
 │   └── internal/
 │       ├── balancer/   # Round Robin
-│       ├── auth/       # API key authentication
+│       ├── auth/       # API keys and role-based access control
 │       ├── proxy/      # implemented
 │       ├── router/     # implemented
 │       ├── middleware/ # planned
@@ -125,10 +126,11 @@ Phase 0 created the directory structure; Phase 1 adds gateway and service source
 | 3C | Add bounded retries for eligible upstream transport failures | Implemented; tests included |
 | 4A | Add in-memory token-bucket rate limiting per client IP | Implemented; tests included |
 | 4B.1 | Add API key authentication for gateway API routes | Implemented; tests included |
-| Later | Add JWT/role-based authorization, distributed rate limiting, adaptive routing, and metrics | Pending |
+| 4B.2 | Add role-based access control for API keys | Implemented; tests included |
+| Later | Add JWT/OAuth, distributed authentication/rate limiting, adaptive routing, and metrics | Pending |
 | Later | Add dashboard, anomaly detection, load experiments, and deployment automation | Pending |
 
-Phase 1, Phase 2A, Phase 2B, Phase 3A, Phase 3B, Phase 3C, Phase 4A, and Phase 4B.1 implementations are recorded below. Later-phase work remains pending.
+Phase 1, Phase 2A, Phase 2B, Phase 3A, Phase 3B, Phase 3C, Phase 4A, Phase 4B.1, and Phase 4B.2 implementations are recorded below. Later-phase work remains pending.
 
 ## Run locally
 
@@ -161,6 +163,15 @@ Invoke-RestMethod http://localhost:8080/health
 
 Authentication is enabled by default. To explicitly disable it for isolated development only, set `INTELLIGATE_AUTH_ENABLED=false`; do not use that mode for exposed deployments.
 
+For role-based local testing, use `INTELLIGATE_API_KEY_ROLES` instead of `INTELLIGATE_API_KEYS`:
+
+```powershell
+$env:INTELLIGATE_API_KEY_ROLES = '{"local-admin-key":"admin","local-read-key":"read","local-write-key":"write"}'
+Remove-Item Env:\INTELLIGATE_API_KEYS -ErrorAction SilentlyContinue
+```
+
+The legacy `INTELLIGATE_API_KEYS` configuration remains supported and assigns every listed key the `admin` role. Do not set both variables. Both JSON-mapped and legacy credentials are placeholders here; use protected secret management for real keys.
+
 ## Run tests
 
 ```powershell
@@ -181,6 +192,6 @@ There is no Docker deployment configuration. Run the gateway and services direct
 
 ## Current implementation status
 
-- **Implemented:** Phase 1 Go reverse proxy and three FastAPI services; Phase 2A per-service Round Robin; Phase 2B health checks and health-aware selection; Phase 3A configurable upstream request timeout; Phase 3B per-backend circuit breakers; Phase 3C bounded controlled retries; Phase 4A in-memory per-client-IP token bucket; Phase 4B.1 API key authentication.
-- **Not implemented:** JWT/role-based authorization, distributed rate-limit storage, adaptive routing, database/cache integration, monitoring, dashboard, load tests, Docker configuration, and CI/CD workflows.
+- **Implemented:** Phase 1 Go reverse proxy and three FastAPI services; Phase 2A per-service Round Robin; Phase 2B health checks and health-aware selection; Phase 3A configurable upstream request timeout; Phase 3B per-backend circuit breakers; Phase 3C bounded controlled retries; Phase 4A in-memory per-client-IP token bucket; Phase 4B.1 API-key authentication; Phase 4B.2 role-based access control.
+- **Not implemented:** JWT/OAuth, distributed authentication/rate-limit storage, adaptive routing, database/cache integration, monitoring, dashboard, load tests, Docker configuration, and CI/CD workflows.
 - **Verification:** Current test and manual integration procedures are recorded in [TESTING.md](./TESTING.md); actual run results are recorded in [DEVELOPMENT_LOG.md](./DEVELOPMENT_LOG.md).

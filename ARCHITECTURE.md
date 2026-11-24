@@ -1,6 +1,6 @@
 # IntelliGate Proposed Architecture
 
-**Status:** Phase 1 implements the Go HTTP reverse proxy and three FastAPI services. Phase 2A adds per-service Round Robin pools; Phase 2B adds active health probes and selects only healthy instances; Phase 3A adds configurable upstream request timeouts; Phase 3B adds per-backend circuit breakers; Phase 3C adds bounded retries for eligible upstream transport failures; Phase 4A adds an in-memory per-client-IP token bucket; Phase 4B.1 adds API-key authentication for gateway API routes. JWT/role-based authorization, distributed rate limiting, adaptive routing, databases, monitoring, and the other integrations described below remain proposed.
+**Status:** Phase 1 implements the Go HTTP reverse proxy and three FastAPI services. Phase 2A adds per-service Round Robin pools; Phase 2B adds active health probes and selects only healthy instances; Phase 3A adds configurable upstream request timeouts; Phase 3B adds per-backend circuit breakers; Phase 3C adds bounded retries for eligible upstream transport failures; Phase 4A adds an in-memory per-client-IP token bucket; Phase 4B.1 adds API-key authentication; Phase 4B.2 adds role-based access control. JWT/OAuth, distributed authentication/rate limiting, adaptive routing, databases, monitoring, and the other integrations described below remain proposed.
 
 ## 1. High-level system architecture
 
@@ -25,7 +25,7 @@ flowchart LR
 
 **Status note:** Gateway-to-service HTTP connections, API-key authentication, Round Robin selection, active health checks, configurable upstream request timeouts, per-backend circuit breakers, controlled retries, and in-memory per-IP rate limiting are implemented. Redis, PostgreSQL, Prometheus, Grafana, Locust, dashboard, and anomaly-detection connections remain proposed. No containerized deployment is included.
 
-### Phase 1/4B.1 runtime configuration
+### Phase 1/4B.2 runtime configuration
 
 | Component | Local address | Gateway route |
 | --- | --- | --- |
@@ -44,7 +44,9 @@ Circuit-breaker policy is global and applied independently to every configured b
 
 The in-memory per-client token bucket is enabled by default. `INTELLIGATE_RATE_LIMIT_ENABLED=false` disables it. When enabled, `INTELLIGATE_RATE_LIMIT_RATE` defaults to 10 tokens per second and `INTELLIGATE_RATE_LIMIT_BURST` defaults to a capacity of 20 tokens; malformed, non-finite, zero, or negative values fail startup. Client identity is the canonical IP parsed from `RemoteAddr`; `X-Forwarded-For` and `X-Real-IP` are ignored. Gateway `GET /health` is exempt. Idle buckets expire after 10 minutes and a cleanup loop runs every minute. This quota is local to one gateway process; shared Redis state remains proposed.
 
-API-key authentication is enabled by default. `INTELLIGATE_AUTH_ENABLED=false` explicitly disables it; when enabled, `INTELLIGATE_API_KEYS` is required and contains comma-separated keys. Surrounding whitespace is trimmed. Empty entries, empty configuration, and keys containing whitespace/control or non-ASCII characters fail startup. The gateway protects `/api/v1` and all `/api/v1/*` paths, including routes added in the future; only `GET /health` is public. Do not put real keys in source-controlled configuration. For deployment, provide high-entropy keys through protected secret management and use TLS.
+API-key authentication is enabled by default. `INTELLIGATE_AUTH_ENABLED=false` explicitly disables authentication. Configure credentials using exactly one of `INTELLIGATE_API_KEY_ROLES` (a JSON object mapping keys to `admin`, `read`, or `write`) or legacy comma-separated `INTELLIGATE_API_KEYS`; setting both is a startup error. The legacy list remains compatible and assigns every key the `admin` role. Role JSON must be a non-empty object with unique, non-empty keys and recognized role names. Malformed JSON, duplicate/ambiguous keys, invalid entries, and unknown roles fail startup without exposing credential values. Surrounding key whitespace is trimmed.
+
+The gateway protects `/api/v1` and all `/api/v1/*` paths, including future routes. `admin` and `write` allow GET, HEAD, POST, PUT, PATCH, and DELETE; `read` allows only GET and HEAD. Other methods are rejected with 403. Missing or invalid keys return 401; authenticated requests without method permission return 403. Only `GET /health` is public. Roles come only from the authenticated key and are stored in request context; client-supplied role headers/query parameters are not trusted. Do not put real keys in source-controlled configuration. For deployment, provide high-entropy keys through protected secret management and use TLS.
 
 ## 2. Component responsibilities
 
@@ -55,7 +57,7 @@ Beyond the Phase 1 behavior below, the gateway is planned to:
 - Expose a public HTTP entry point and statically route the three service prefixes (implemented).
 - Log each request method and path, without query parameters (implemented).
 - Return `404 Not Found` for unmatched paths, `503 Service Unavailable` when no backend is eligible, and `502 Bad Gateway` when a selected backend cannot be reached (implemented).
-- Authenticate protected clients with an API key before per-client rate limiting (implemented in Phase 4B.1).
+- Authenticate protected clients and authorize API methods from the credential role before per-client rate limiting (implemented in Phases 4B.1/4B.2).
 - Select a configured backend instance round-robin within each service pool (implemented in Phase 2A).
 - Probe backend health and select only healthy instances (implemented in Phase 2B).
 - Admit only healthy instances whose circuit breaker permits a request (implemented in Phase 3B).
@@ -90,15 +92,16 @@ Each service will own its domain API. Service-level validation and persistence d
 
 ## 3. Request lifecycle
 
-The Phase 4B.1 application request path is:
+The Phase 4B.2 application request path is:
 
 1. Receive an HTTP request at port 8080.
 2. Log the method and path without query parameters or credentials.
-3. Validate `X-API-Key` on `/api/v1` and `/api/v1/*`; return 401 for a missing or invalid key. The key is removed before proxying. `GET /health` is public.
-4. Consume a token from the client's IP bucket; return 429 with `Retry-After` if no token is available. `GET /health` also bypasses this limiter.
-5. Match the request path to one of the three service prefixes; return 404 if none matches.
-6. Select the next healthy configured instance whose breaker admits a request; return 503 if none is eligible.
-7. Proxy the request with its original path and query; eligible GET/HEAD transport failures may retry under the bounded Phase 3C policy.
+3. Validate `X-API-Key` on `/api/v1` and `/api/v1/*`; return 401 for a missing or invalid key. Resolve the role from the key and attach it to the request context. `GET /health` is public.
+4. Authorize the method for that role; return 403 if it is unsupported or not permitted. Client role headers and query parameters are ignored.
+5. Consume a token from the client's IP bucket; return 429 with `Retry-After` if no token is available. `GET /health` also bypasses this limiter.
+6. Match the request path to one of the three service prefixes; return 404 if none matches.
+7. Select the next healthy configured instance whose breaker admits a request; return 503 if none is eligible.
+8. Proxy the request with its original path and query; eligible GET/HEAD transport failures may retry under the bounded Phase 3C policy.
 
 Separately, the health checker probes every configured instance directly at `/health`. The gateway marks all instances unhealthy before the first probe cycle, completes that cycle before accepting application traffic, then starts periodic checks. Probe status changes update the corresponding selector; later successful probes restore eligibility.
 
@@ -134,7 +137,8 @@ sequenceDiagram
     participant P as Prometheus (planned)
     C->>G: Request
     G->>G: Log method/path; do not log credentials
-    G->>G: Validate API key unless GET /health
+    G->>G: Authenticate API key and resolve role unless GET /health
+    G->>G: Authorize method for role
     G->>G: Consume process-local client token unless GET /health
     G->>G: Match route
     G->>LB: Select healthy instance (Round Robin implemented)
@@ -148,13 +152,26 @@ sequenceDiagram
 
 The diagram represents intended later-phase interactions except for service-route matching, HTTP proxying, per-service Round Robin selection, active health checking, upstream timeouts, circuit-breaker admission, and bounded transport-error retries, which are implemented.
 
-## 4. API key authentication flow (implemented in Phase 4B.1)
+## 4. API key authentication and role authorization (implemented in Phases 4B.1/4B.2)
 
-Every `/api/v1` and `/api/v1/*` request must carry one configured key in `X-API-Key`. The gateway accepts any configured key from comma-separated `INTELLIGATE_API_KEYS`, trims surrounding configuration whitespace, and compares SHA-256 digests with `crypto/subtle` constant-time comparison. Missing, invalid, or repeated header values return the same `401 Unauthorized` JSON response: `{"error":"unauthorized"}`. Keys are not included in logs or errors and are removed from the request before it reaches a backend.
+Every `/api/v1` and `/api/v1/*` request must carry one configured key in `X-API-Key`. Use one configuration source:
 
-Authentication is enabled by default. `INTELLIGATE_AUTH_ENABLED=false` is an explicit opt-out; otherwise missing or malformed `INTELLIGATE_API_KEYS` prevents startup. Gateway `GET /health` remains public and is not proxied. Middleware order is request logging (method/path only) → API-key authentication → rate limiting → gateway mux/router → health-aware selection, retry, and proxy handling. Thus an unauthorized request neither consumes a rate-limit token nor reaches backend selection.
+- `INTELLIGATE_API_KEY_ROLES`: a JSON object mapping each API key to `admin`, `read`, or `write`.
+- `INTELLIGATE_API_KEYS`: the backward-compatible comma-separated key list. If the role map is absent, every legacy key is assigned `admin`.
 
-This is shared-secret authentication only. Keys are process configuration, not distributed, and key rotation/revocation requires updating configuration and restarting the gateway. There are no users, roles, JWTs, or per-key quotas. Use high-entropy values, protected secret management, and TLS outside local development; do not commit real keys.
+Setting both variables is rejected as ambiguous. Startup rejects malformed JSON, empty/duplicate/ambiguous keys, and unknown roles. Keys are trimmed and retained as SHA-256 digests in the authenticator. Fixed-size digests are compared using `crypto/subtle`; credential values are not logged or returned in errors.
+
+| Role | Allowed API methods |
+| --- | --- |
+| `admin` | GET, HEAD, POST, PUT, PATCH, DELETE |
+| `read` | GET, HEAD |
+| `write` | GET, HEAD, POST, PUT, PATCH, DELETE |
+
+Unsupported methods (including OPTIONS, TRACE, and CONNECT) are rejected with `403 Forbidden`, even for `admin`. Missing or invalid credentials return `401 Unauthorized` with `{"error":"unauthorized"}`. A valid credential lacking method permission returns `403 Forbidden` with `{"error":"forbidden"}`. Roles are attached to a private request-context key after authentication; client-supplied headers or query parameters cannot assign roles. `X-API-Key`, `X-Role`, `X-User-Role`, and `X-Intelligate-Role` are removed before proxying. `GET /health` remains public.
+
+Middleware order is request logging (method/path only) → authentication → authorization → rate limiting → gateway mux/router → health-aware selection, retry, and proxy handling. Unauthorized and forbidden requests therefore do not consume limiter tokens or contact backends.
+
+This is process-local shared-key authentication, not JWT/OAuth or a distributed identity service. Legacy API keys remain unrestricted `admin` keys until migrated to an explicit role map. Configuration changes require a gateway restart; no key rotation/revocation service exists. Direct microservice ports bypass gateway authentication. Use high-entropy values, protected secret management, and TLS outside local development; do not commit real keys.
 
 ## 5. Rate-limiting architecture
 

@@ -245,7 +245,7 @@ func TestCircuitBreakerConfigFromEnvRejectsInvalidValues(t *testing.T) {
 }
 
 func TestAuthenticationSettingsFromEnvRequiresKeysByDefault(t *testing.T) {
-	unsetEnvironment(t, authEnabledEnv, apiKeysEnv)
+	unsetEnvironment(t, authEnabledEnv, apiKeysEnv, apiKeyRolesEnv)
 
 	_, err := authenticationSettingsFromEnv()
 	if err == nil {
@@ -257,6 +257,7 @@ func TestAuthenticationSettingsFromEnvRequiresKeysByDefault(t *testing.T) {
 }
 
 func TestAuthenticationSettingsFromEnvAcceptsAndTrimsMultipleKeys(t *testing.T) {
+	unsetEnvironment(t, apiKeyRolesEnv)
 	t.Setenv(authEnabledEnv, "true")
 	t.Setenv(apiKeysEnv, "  first-key , second-key  ")
 
@@ -267,10 +268,36 @@ func TestAuthenticationSettingsFromEnvAcceptsAndTrimsMultipleKeys(t *testing.T) 
 	if !settings.Enabled || settings.Authenticator == nil {
 		t.Fatalf("authentication settings = %+v, want enabled authenticator", settings)
 	}
+	handler := settings.Authenticator.Middleware(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	for _, key := range []string{"first-key", "second-key"} {
+		request := httptest.NewRequest(http.MethodPost, "/api/v1/products", nil)
+		request.Header.Set(auth.APIKeyHeader, key)
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, request)
+		if recorder.Code != http.StatusNoContent {
+			t.Errorf("legacy key %q status = %d, want 204 admin access", key, recorder.Code)
+		}
+	}
+}
+
+func TestAuthenticationSettingsFromEnvAcceptsRoleMapping(t *testing.T) {
+	unsetEnvironment(t, apiKeysEnv)
+	t.Setenv(authEnabledEnv, "true")
+	t.Setenv(apiKeyRolesEnv, `{"admin-key":"admin","read-key":"read","write-key":"write"}`)
+
+	settings, err := authenticationSettingsFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !settings.Enabled || settings.Authenticator == nil {
+		t.Fatalf("authentication settings = %+v, want role-aware authenticator", settings)
+	}
 }
 
 func TestAuthenticationSettingsFromEnvCanBeExplicitlyDisabled(t *testing.T) {
-	unsetEnvironment(t, authEnabledEnv, apiKeysEnv)
+	unsetEnvironment(t, authEnabledEnv, apiKeysEnv, apiKeyRolesEnv)
 	t.Setenv(authEnabledEnv, "false")
 
 	settings, err := authenticationSettingsFromEnv()
@@ -283,6 +310,7 @@ func TestAuthenticationSettingsFromEnvCanBeExplicitlyDisabled(t *testing.T) {
 }
 
 func TestAuthenticationSettingsFromEnvRejectsMalformedConfiguration(t *testing.T) {
+	unsetEnvironment(t, apiKeyRolesEnv)
 	tests := []struct {
 		name  string
 		value string
@@ -312,7 +340,59 @@ func TestAuthenticationSettingsFromEnvRejectsMalformedConfiguration(t *testing.T
 	}
 }
 
+func TestAuthenticationSettingsFromEnvRejectsMalformedRoleConfiguration(t *testing.T) {
+	unsetEnvironment(t, apiKeysEnv)
+	tests := []struct {
+		name  string
+		value string
+	}{
+		{name: "empty", value: ""},
+		{name: "invalid JSON", value: `{"read-key":`},
+		{name: "not an object", value: `["read-key"]`},
+		{name: "empty object", value: `{}`},
+		{name: "unknown role", value: `{"read-key":"owner"}`},
+		{name: "duplicate key", value: `{"key":"admin","key":"read"}`},
+		{name: "normalized duplicate", value: `{" key ":"read","key":"write"}`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			unsetEnvironment(t, apiKeysEnv)
+			t.Setenv(authEnabledEnv, "true")
+			t.Setenv(apiKeyRolesEnv, test.value)
+			_, err := authenticationSettingsFromEnv()
+			if err == nil {
+				t.Fatal("authenticationSettingsFromEnv() error = nil, want invalid role configuration error")
+			}
+			if !strings.Contains(err.Error(), apiKeyRolesEnv) {
+				t.Errorf("error %q does not identify %s", err, apiKeyRolesEnv)
+			}
+			if strings.Contains(err.Error(), "read-key") || strings.Contains(err.Error(), "owner") {
+				t.Errorf("error exposed role mapping data: %q", err)
+			}
+		})
+	}
+}
+
+func TestAuthenticationSettingsFromEnvRejectsBothKeyConfigurations(t *testing.T) {
+	unsetEnvironment(t, authEnabledEnv, apiKeysEnv, apiKeyRolesEnv)
+	t.Setenv(authEnabledEnv, "true")
+	t.Setenv(apiKeysEnv, "legacy-key")
+	t.Setenv(apiKeyRolesEnv, `{"admin-key":"admin"}`)
+
+	_, err := authenticationSettingsFromEnv()
+	if err == nil {
+		t.Fatal("authenticationSettingsFromEnv() error = nil, want ambiguous configuration error")
+	}
+	if !strings.Contains(err.Error(), apiKeysEnv) || !strings.Contains(err.Error(), apiKeyRolesEnv) {
+		t.Fatalf("error %q must identify both conflicting environment variables", err)
+	}
+	if strings.Contains(err.Error(), "legacy-key") || strings.Contains(err.Error(), "admin-key") {
+		t.Errorf("error exposed configured key data: %q", err)
+	}
+}
+
 func TestAuthenticationSettingsFromEnvRejectsInvalidEnabledFlag(t *testing.T) {
+	unsetEnvironment(t, apiKeysEnv, apiKeyRolesEnv)
 	t.Setenv(authEnabledEnv, "sometimes")
 	t.Setenv(apiKeysEnv, "placeholder-key")
 
@@ -519,6 +599,118 @@ func TestUnauthenticatedRequestDoesNotConsumeRateLimitTokenOrReachBackend(t *tes
 	healthResponse := perform("/health", "")
 	if healthResponse.Code != http.StatusOK {
 		t.Fatalf("unauthenticated health status = %d, want 200", healthResponse.Code)
+	}
+}
+
+func TestReadRoleCannotReachUpstreamAndForbiddenRequestDoesNotConsumeToken(t *testing.T) {
+	type observedRequest struct {
+		method          string
+		requestURI      string
+		apiKey          string
+		role            string
+		userRole        string
+		intelligateRole string
+	}
+	upstreamRequests := make(chan observedRequest, 2)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/health" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		upstreamRequests <- observedRequest{
+			method:          r.Method,
+			requestURI:      r.URL.RequestURI(),
+			apiKey:          r.Header.Get(auth.APIKeyHeader),
+			role:            r.Header.Get("X-Role"),
+			userRole:        r.Header.Get("X-User-Role"),
+			intelligateRole: r.Header.Get("X-Intelligate-Role"),
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+	t.Setenv("PRODUCT_SERVICE_URLS", upstream.URL)
+
+	selector, backends, err := newServiceProxy(
+		"PRODUCT_SERVICE_URLS",
+		"http://localhost:8001",
+		time.Second,
+		circuitbreaker.DefaultConfig(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checker, err := health.NewChecker(backends, time.Hour, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := checker.CheckNow(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	authenticator, err := auth.NewWithRoles(map[string]auth.Role{"read-role-key": auth.RoleRead})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rateLimitConfig := ratelimit.DefaultConfig()
+	rateLimitConfig.Rate = 1
+	rateLimitConfig.Burst = 1
+	limiter, err := ratelimit.New(rateLimitConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := newHandlerWithAuthentication(
+		selector,
+		http.NotFoundHandler(),
+		http.NotFoundHandler(),
+		authenticator,
+		limiter,
+	)
+	perform := func(method string, target string) *httptest.ResponseRecorder {
+		request := httptest.NewRequest(method, target, nil)
+		request.RemoteAddr = "192.0.2.61:4321"
+		request.Header.Set(auth.APIKeyHeader, "read-role-key")
+		request.Header.Set("X-Role", "admin")
+		request.Header.Set("X-User-Role", "admin")
+		request.Header.Set("X-Intelligate-Role", "admin")
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, request)
+		return recorder
+	}
+
+	forbidden := perform(http.MethodPost, "/api/v1/products?role=admin")
+	if forbidden.Code != http.StatusForbidden {
+		t.Fatalf("read-role POST status = %d, want 403", forbidden.Code)
+	}
+	select {
+	case got := <-upstreamRequests:
+		t.Fatalf("forbidden request reached upstream: %+v", got)
+	default:
+	}
+
+	allowed := perform(http.MethodGet, "/api/v1/products?role=admin")
+	if allowed.Code != http.StatusNoContent {
+		t.Fatalf("read-role GET after forbidden POST status = %d, want 204; forbidden request must not consume a token", allowed.Code)
+	}
+	select {
+	case got := <-upstreamRequests:
+		if got.method != http.MethodGet || got.requestURI != "/api/v1/products?role=admin" {
+			t.Errorf("upstream request = %+v, want GET with preserved query", got)
+		}
+		if got.apiKey != "" || got.role != "" || got.userRole != "" || got.intelligateRole != "" {
+			t.Errorf("upstream received authentication metadata: %+v", got)
+		}
+	default:
+		t.Fatal("authorized GET did not reach upstream")
+	}
+
+	limited := perform(http.MethodGet, "/api/v1/products")
+	if limited.Code != http.StatusTooManyRequests {
+		t.Fatalf("second authorized GET status = %d, want 429", limited.Code)
+	}
+	healthResponse := httptest.NewRecorder()
+	handler.ServeHTTP(healthResponse, httptest.NewRequest(http.MethodGet, "/health", nil))
+	if healthResponse.Code != http.StatusOK {
+		t.Fatalf("public health status = %d, want 200", healthResponse.Code)
 	}
 }
 

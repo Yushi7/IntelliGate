@@ -1,6 +1,6 @@
 # Testing Strategy
 
-**Status:** Phase 1 includes Go router/proxy tests and pytest service endpoint tests. Phase 2A and 2B include Go Round Robin, active health-check, and gateway integration tests. Phase 3A adds timeout configuration and proxy timeout tests. Phase 3B adds circuit-breaker state, selector, proxy-outcome, and configuration tests. Phase 3C adds controlled retry, deadline, and admission tests. Phase 4A adds token-bucket, cleanup, configuration, and gateway-middleware tests. Phase 4B.1 adds API-key parsing, constant-time validation, configuration, middleware-order, health-exemption, and unauthorized-request tests.
+**Status:** Phase 1 includes Go router/proxy tests and pytest service endpoint tests. Phase 2A and 2B include Go Round Robin, active health-check, and gateway integration tests. Phase 3A adds timeout configuration and proxy timeout tests. Phase 3B adds circuit-breaker state, selector, proxy-outcome, and configuration tests. Phase 3C adds controlled retry, deadline, and admission tests. Phase 4A adds token-bucket, cleanup, configuration, and gateway-middleware tests. Phase 4B.1 adds API-key authentication tests; Phase 4B.2 adds role configuration, per-method authorization, middleware-order, request-context isolation, and gateway integration tests.
 
 ## Principles
 
@@ -12,7 +12,7 @@
 
 ## Go unit testing
 
-Use the Go standard `testing` package for gateway packages. Phase 2B tests health-aware selection and probing. Phase 3A tests timeout configuration, timely/timed-out upstreams, 504 mapping, concurrent request handling, and existing error/path behavior. Phase 3B tests breaker defaults and config validation, consecutive failure threshold and reset, cooldown, HALF-OPEN admission limits, successful close, failed reopen, stale permits, cancellation, concurrent outcomes, backend isolation, Round Robin exclusion/re-entry, health-probe independence, and gateway-vs-application response classification. Phase 3C tests GET/HEAD-only retries, bounded attempts, backoff order/cancellation, replayable request bodies, alternate and single-backend selection, health/breaker admission, HALF-OPEN trials, application-status non-retry, body-stream non-retry, client-vs-gateway deadlines, retry-budget timeout, and permit completion. Phase 4A tests token consumption/refill, Retry-After rounding, per-IP separation and IPv4/IPv6 parsing, concurrent capacity, cleanup, environment validation, disabled behavior, health exemption, spoofed forwarding headers, and rejection before routing. Existing 404, 429, 502, 503, 504, and path/query tests provide regression coverage. JWT/role-based authorization, distributed shared quotas, adaptive scoring, EWMA, and metrics remain planned.
+Use the Go standard `testing` package for gateway packages. Phase 2B tests health-aware selection and probing. Phase 3A tests timeout configuration, timely/timed-out upstreams, 504 mapping, concurrent request handling, and existing error/path behavior. Phase 3B tests breaker defaults and config validation, consecutive failure threshold and reset, cooldown, HALF-OPEN admission limits, successful close, failed reopen, stale permits, cancellation, concurrent outcomes, backend isolation, Round Robin exclusion/re-entry, health-probe independence, and gateway-vs-application response classification. Phase 3C tests GET/HEAD-only retries, bounded attempts, backoff order/cancellation, replayable request bodies, alternate and single-backend selection, health/breaker admission, HALF-OPEN trials, application-status non-retry, body-stream non-retry, client-vs-gateway deadlines, retry-budget timeout, and permit completion. Phase 4A tests token consumption/refill, Retry-After rounding, per-IP separation and IPv4/IPv6 parsing, concurrent capacity, cleanup, environment validation, disabled behavior, health exemption, spoofed forwarding headers, and rejection before routing. Existing 401, 403, 404, 429, 502, 503, 504, and path/query tests provide regression coverage. JWT/OAuth, distributed shared quotas, adaptive scoring, EWMA, and metrics remain planned.
 
 ## FastAPI testing with Pytest
 
@@ -26,6 +26,7 @@ Run the gateway tests:
 Set-Location gateway
 go test ./...
 go test -count=10 ./internal/auth
+go test -count=10 ./cmd/gateway
 go test -race ./...
 Set-Location ..
 ```
@@ -171,28 +172,31 @@ Once components exist, verify gateway-to-Redis rate-limit behavior, gateway-to-P
 
 Verify service path routing, method/body/header forwarding, response propagation, timeouts, unavailable backends, malformed upstream responses, and behavior when no backend is eligible. Confirm that client credentials and sensitive headers are not accidentally forwarded to unrelated services.
 
-## API-key authentication testing (implemented in Phase 4B.1)
+## API-key authentication and RBAC testing (implemented in Phases 4B.1/4B.2)
 
-Automated tests cover multiple configured keys, whitespace trimming and malformed configuration, missing/invalid/repeated keys returning the same 401 JSON, required keys at startup, concurrent validation, no API key forwarding to services, and authentication before rate limiting and routing. They also verify that `GET /health` is public and unauthorized requests neither consume a token nor reach a backend. JWT, role, expiration, and revocation tests do not apply to this shared-key phase.
+Automated tests cover multiple configured keys, strict JSON role mapping, malformed/duplicate/unknown-role configuration, ambiguity when both key variables are set, and legacy keys retaining `admin`. Method tests cover all six supported methods for `admin`/`write`, GET/HEAD-only access for `read`, and 403 for denied or unsupported methods. Integration tests verify client-supplied role headers/query parameters cannot escalate privileges, forbidden/unauthorized requests do not consume limiter tokens or reach upstreams, key and role headers are not forwarded, public health behavior, and concurrent role isolation. Missing/invalid keys remain 401; authenticated method denial is 403.
 
-For a local manual check, use only placeholder values (do not put real keys in documentation or source control). Configure and start the gateway:
+For a local role-based check, use only placeholder values (do not put real keys in documentation or source control). Configure exactly one key source and start the gateway:
 
 ```powershell
 $env:INTELLIGATE_AUTH_ENABLED = "true"
-$env:INTELLIGATE_API_KEYS = "local-placeholder-key-one,local-placeholder-key-two"
+$env:INTELLIGATE_API_KEY_ROLES = '{"local-admin-key":"admin","local-read-key":"read","local-write-key":"write"}'
+Remove-Item Env:\INTELLIGATE_API_KEYS -ErrorAction SilentlyContinue
 Set-Location gateway
 go run .\cmd\gateway
 ```
 
-In another terminal, check the unauthenticated and authenticated behavior:
+In another terminal, check read access, forbidden write access, admin access, and public health:
 
 ```powershell
 try { (Invoke-WebRequest -UseBasicParsing http://localhost:8080/api/v1/products).StatusCode } catch { [int]$_.Exception.Response.StatusCode }
-(Invoke-WebRequest -UseBasicParsing http://localhost:8080/api/v1/products -Headers @{ "X-API-Key" = "local-placeholder-key-one" }).StatusCode
+(Invoke-WebRequest -UseBasicParsing http://localhost:8080/api/v1/products -Headers @{ "X-API-Key" = "local-read-key" }).StatusCode
+try { (Invoke-WebRequest -UseBasicParsing -Method Post http://localhost:8080/api/v1/products -Headers @{ "X-API-Key" = "local-read-key" }).StatusCode } catch { [int]$_.Exception.Response.StatusCode }
+(Invoke-WebRequest -UseBasicParsing http://localhost:8080/api/v1/products -Headers @{ "X-API-Key" = "local-admin-key" }).StatusCode
 (Invoke-WebRequest -UseBasicParsing http://localhost:8080/health).StatusCode
 ```
 
-The expected statuses are 401, the backend response status, and 200 respectively. An API key is stripped before proxying and should not appear in backend logs or responses.
+Expected behavior: unauthenticated API request returns 401; read-role GET and admin GET return the backend response; read-role POST returns 403 before contacting the service; public health returns 200. Legacy `INTELLIGATE_API_KEYS` remains supported and assigns every key `admin`; migrate to `INTELLIGATE_API_KEY_ROLES` for least privilege, and never set both.
 
 ## Rate-limiting testing
 
@@ -234,4 +238,4 @@ Inject controlled backend failure, latency, and restart/recovery events in a loc
 
 ## Current status
 
-Phase 1 service tests and Phase 2A/2B/3A/3B/3C/4A/4B.1 Go routing, health-check, timeout, circuit-breaker, retry, rate-limit, authentication, and simulated integration tests are implemented. Record manual verification results in [DEVELOPMENT_LOG.md](./DEVELOPMENT_LOG.md) only after running them. Tests for JWT/roles, distributed quotas, databases, adaptive routing, and monitoring are not implemented.
+Phase 1 service tests and Phase 2A/2B/3A/3B/3C/4A/4B.1/4B.2 Go routing, health-check, timeout, circuit-breaker, retry, rate-limit, API-key authentication, RBAC, and simulated integration tests are implemented. Record manual verification results in [DEVELOPMENT_LOG.md](./DEVELOPMENT_LOG.md) only after running them. Tests for JWT/OAuth, distributed quotas, databases, adaptive routing, and monitoring are not implemented.

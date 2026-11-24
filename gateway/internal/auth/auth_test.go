@@ -172,3 +172,215 @@ func TestMiddlewareValidatesConcurrentRequestsSafely(t *testing.T) {
 	}
 	wait.Wait()
 }
+
+func TestParseRoleMappingAcceptsTrimmedKeysAndKnownRoles(t *testing.T) {
+	roles, err := ParseRoleMapping(`{" admin-key ":"admin","read-key":"read","write-key":"write"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]Role{
+		"admin-key": RoleAdmin,
+		"read-key":  RoleRead,
+		"write-key": RoleWrite,
+	}
+	if !reflect.DeepEqual(roles, want) {
+		t.Fatalf("roles = %#v, want %#v", roles, want)
+	}
+}
+
+func TestParseRoleMappingRejectsMalformedDuplicateAndUnknownEntries(t *testing.T) {
+	for _, value := range []string{
+		"",
+		" ",
+		"[]",
+		"{}",
+		`{"key":"unknown"}`,
+		`{"key":1}`,
+		`{"key":"read",}`,
+		`{"key":"read"} trailing`,
+		`{"same-key":"admin","same-key":"read"}`,
+		`{" same-key ":"read","same-key":"write"}`,
+		`{"bad,key":"admin"}`,
+		`{"":"read"}`,
+	} {
+		t.Run(value, func(t *testing.T) {
+			_, err := ParseRoleMapping(value)
+			if err == nil {
+				t.Fatal("ParseRoleMapping() error = nil, want invalid mapping error")
+			}
+			if strings.Contains(err.Error(), "same-key") || strings.Contains(err.Error(), "bad,key") {
+				t.Errorf("error exposed configured API key: %q", err)
+			}
+		})
+	}
+}
+
+func TestNewWithRolesRejectsEmptyDuplicateAndUnknownRoles(t *testing.T) {
+	for _, roles := range []map[string]Role{
+		nil,
+		{},
+		{"key": "owner"},
+		{"": RoleAdmin},
+		{"bad,key": RoleAdmin},
+		{"same-key": RoleAdmin, " same-key ": RoleRead},
+	} {
+		if _, err := NewWithRoles(roles); err == nil {
+			t.Errorf("NewWithRoles(%#v) error = nil, want invalid mapping error", roles)
+		}
+	}
+}
+
+func TestAdminRoleAllowsSupportedMethodsAndRejectsUnsupportedMethods(t *testing.T) {
+	authenticator, err := NewWithRoles(map[string]Role{"admin-key": RoleAdmin})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertRoleMethods(t, authenticator, "admin-key",
+		[]string{"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"},
+		[]string{"OPTIONS", "TRACE", "CONNECT"},
+	)
+}
+
+func TestReadRoleAllowsOnlyGETAndHEAD(t *testing.T) {
+	authenticator, err := NewWithRoles(map[string]Role{"read-key": RoleRead})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertRoleMethods(t, authenticator, "read-key",
+		[]string{"GET", "HEAD"},
+		[]string{"POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
+	)
+}
+
+func TestWriteRoleAllowsSupportedMethods(t *testing.T) {
+	authenticator, err := NewWithRoles(map[string]Role{"write-key": RoleWrite})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertRoleMethods(t, authenticator, "write-key",
+		[]string{"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"},
+		[]string{"OPTIONS", "TRACE", "CONNECT"},
+	)
+}
+
+func TestLegacyAPIKeysRetainAdminAccess(t *testing.T) {
+	authenticator, err := New([]string{"legacy-key"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertRoleMethods(t, authenticator, "legacy-key",
+		[]string{"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"},
+		[]string{"OPTIONS", "TRACE", "CONNECT"},
+	)
+}
+
+func TestClientRoleHeadersAndQueryCannotEscalateReadRole(t *testing.T) {
+	authenticator, err := NewWithRoles(map[string]Role{"read-key": RoleRead})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := authenticator.Middleware(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/products?role=admin", nil)
+	request.Header.Set(APIKeyHeader, "read-key")
+	request.Header.Set("X-Role", "admin")
+	request.Header.Set("X-User-Role", "admin")
+	request.Header.Set("X-Intelligate-Role", "admin")
+	recorder := httptest.NewRecorder()
+
+	handler.ServeHTTP(recorder, request)
+
+	assertForbidden(t, recorder)
+}
+
+func TestConcurrentRequestsDoNotLeakRolesBetweenClients(t *testing.T) {
+	authenticator, err := NewWithRoles(map[string]Role{
+		"admin-key": RoleAdmin,
+		"read-key":  RoleRead,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := authenticator.Middleware(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		role, ok := roleFromContext(req.Context())
+		if !ok || role != RoleAdmin {
+			t.Errorf("downstream role = %q, present %t; want admin", role, ok)
+		}
+		if req.Header.Get("X-Role") != "" {
+			t.Errorf("client role header was forwarded: %q", req.Header.Get("X-Role"))
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+
+	const workers = 24
+	const requestsPerWorker = 20
+	var wait sync.WaitGroup
+	wait.Add(workers)
+	for worker := 0; worker < workers; worker++ {
+		go func(worker int) {
+			defer wait.Done()
+			key := "admin-key"
+			wantStatus := http.StatusNoContent
+			if worker%2 == 1 {
+				key = "read-key"
+				wantStatus = http.StatusForbidden
+			}
+			for i := 0; i < requestsPerWorker; i++ {
+				request := httptest.NewRequest(http.MethodPost, "/api/v1/products?role=admin", nil)
+				request.Header.Set(APIKeyHeader, key)
+				request.Header.Set("X-Role", "admin")
+				recorder := httptest.NewRecorder()
+				handler.ServeHTTP(recorder, request)
+				if recorder.Code != wantStatus {
+					t.Errorf("key %q response status = %d, want %d", key, recorder.Code, wantStatus)
+					return
+				}
+			}
+		}(worker)
+	}
+	wait.Wait()
+}
+
+func assertRoleMethods(t *testing.T, authenticator *Authenticator, key string, allowed, denied []string) {
+	t.Helper()
+	handler := authenticator.Middleware(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	for _, method := range allowed {
+		t.Run(method+"_allowed", func(t *testing.T) {
+			request := httptest.NewRequest(method, "/api/v1/products", nil)
+			request.Header.Set(APIKeyHeader, key)
+			recorder := httptest.NewRecorder()
+			handler.ServeHTTP(recorder, request)
+			if recorder.Code != http.StatusNoContent {
+				t.Fatalf("status = %d, want 204", recorder.Code)
+			}
+		})
+	}
+	for _, method := range denied {
+		t.Run(method+"_denied", func(t *testing.T) {
+			request := httptest.NewRequest(method, "/api/v1/products", nil)
+			request.Header.Set(APIKeyHeader, key)
+			recorder := httptest.NewRecorder()
+			handler.ServeHTTP(recorder, request)
+			assertForbidden(t, recorder)
+		})
+	}
+}
+
+func assertForbidden(t *testing.T, recorder *httptest.ResponseRecorder) {
+	t.Helper()
+	if recorder.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403", recorder.Code)
+	}
+	var body struct {
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatalf("response is not valid JSON: %v", err)
+	}
+	if body.Error != "forbidden" {
+		t.Fatalf("error = %q, want forbidden", body.Error)
+	}
+}
