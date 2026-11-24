@@ -1,12 +1,14 @@
 # API Documentation
 
-**Status:** Phase 1 implements the service `GET /`, `GET /health`, and sample collection GET endpoints listed below, plus gateway proxy routing. The remaining operations and policies are planned. The gateway has no separate health, readiness, or metrics endpoint in Phase 1.
+**Status:** Phase 1 implements the service `GET /`, `GET /health`, sample collection GET endpoints, gateway proxy routing, and gateway `GET /health`. Phase 2A adds round-robin distribution across configured backend instances without changing client-facing service routes. Other operations and policies remain planned.
 
 ## Conventions
 
 - Gateway service routes are shown relative to the gateway base URL.
 - Gateway route ownership is: `/api/v1/products/*` → Product Service; `/api/v1/orders/*` → Order Service; `/api/v1/users/*` → User Service.
-- The gateway listens on port `8080`; local services listen on Product `8001`, Order `8002`, and User `8003`.
+- The gateway listens on port `8080`; single-instance defaults are Product `8001`, Order `8002`, and User `8003`.
+- Optional multiple instances are configured with comma-separated full URLs in `PRODUCT_SERVICE_URLS`, `ORDER_SERVICE_URLS`, and `USER_SERVICE_URLS`. No additional port assignment is mandated.
+- Each request is sent to the next configured instance for its service. The gateway does not health-check or retry an unavailable instance; that request returns `502 Bad Gateway`.
 - The gateway preserves the full incoming path and query when proxying. It does not strip the `/api/v1/<service>` prefix.
 - Implemented service routes return sample data and do not require authentication. Do not treat them as production APIs.
 - The user-order listing operation is owned by the Order Service, not the User Service. Although it may be expressed conceptually as `GET /api/v1/users/{user_id}/orders`, it is exposed at `GET /api/v1/orders/users/{user_id}` to follow the Order Service route namespace.
@@ -17,7 +19,13 @@
 
 ## Gateway operational endpoints
 
-No gateway-specific health, readiness, or metrics endpoints are implemented in Phase 1. The operational endpoints below remain planned.
+### `GET /health` (implemented)
+
+- **Purpose:** Gateway liveness.
+- **Response:** `200 OK`, `{"status":"ok","service":"intelligate-gateway"}`.
+- **Routing:** Handled by the gateway and never forwarded to a service.
+
+The following additional operational endpoints remain planned.
 
 ### `GET /healthz` (planned)
 
@@ -145,4 +153,4 @@ Administrative paths are provisional and must not be exposed publicly without an
 
 ## Planned error cases
 
-In Phase 1, the gateway returns `404 Not Found` for an unmapped path and `502 Bad Gateway` when a mapped backend is unavailable. Otherwise, it forwards the backend's response. Authentication failure, rate limiting, invalid-request, and other planned error schemas are not implemented.
+The gateway returns `404 Not Found` for an unmapped path and `502 Bad Gateway` when the selected configured backend is unavailable. Otherwise, it forwards the backend's response. The gateway does not retry another instance. Authentication failure, rate limiting, invalid-request, and other planned error schemas are not implemented.

@@ -40,7 +40,7 @@ Go; Python + FastAPI; React + TypeScript; Tailwind CSS; PostgreSQL; Redis; Prome
 ### Pending implementation tasks
 
 - Phase 1 gateway, service, and foundational routing implementation is complete.
-- Design and test authentication, rate limiting, balancing, health checks, circuit breaking, and recovery.
+- Design and test authentication, rate limiting, adaptive balancing, health checks, circuit breaking, and recovery.
 - Add database/cache integrations, metrics, dashboards, CI, and container orchestration when justified by working components.
 - Add Locust scenarios and conduct experiments; populate results only from actual runs.
 - Evaluate and document anomaly-detection design using suitable data.
@@ -62,3 +62,33 @@ Go; Python + FastAPI; React + TypeScript; Tailwind CSS; PostgreSQL; Redis; Prome
 - Pytest in each service's own virtual environment: Product `2 passed`, Order `2 passed`, User `2 passed`. Each run emitted a Starlette deprecation warning about its current `httpx` test-client integration; no tests failed.
 - Manual local integration: all three gateway routes returned the expected service-specific sample data; Product root and health returned successfully; an unmapped gateway path returned `404`; stopping Product Service caused its gateway route to return `502`.
 - The Go proxy test verified path and query preservation. No performance or broader resilience results are claimed.
+
+## 2026-11-24 — Phase 2A Round Robin load balancing
+
+**Status:** Implemented; standard and repeated concurrent Go tests passed.
+
+### Implemented
+
+- Added a reusable per-service Round Robin handler with a short `sync.Mutex`-protected selection step. Each configured pool advances independently and proxies outside the lock.
+- Added comma-separated `PRODUCT_SERVICE_URLS`, `ORDER_SERVICE_URLS`, and `USER_SERVICE_URLS` configuration. Unset variables retain the existing single-backend defaults (`localhost:8001`, `:8002`, and `:8003`); empty URL entries and invalid backend URLs fail startup.
+- Preserved existing service paths, query strings, 404 behavior, 502 behavior, and gateway health handling. Unavailable instances are not health-filtered or retried; selection continues on the next request.
+- Updated README, architecture, API, testing, and development-log status. No adaptive routing, EWMA, circuit breaker, authentication, rate limiting, database, Redis, Docker, or dashboard feature was added.
+
+### Verification
+
+- `gofmt` completed for changed Go files.
+- `go test ./...` from `gateway`: passed for gateway, balancer, proxy, and router packages.
+- `go test -count=25 ./internal/balancer`: passed, including repeated concurrent selector tests.
+- `go test -race ./...` was attempted but could not compile because the available MinGW `cc1.exe` lacks 64-bit support (`64-bit mode not compiled in`). The race detector result is therefore unverified in this environment.
+- Balancer integration tests use `httptest` instances to verify sequential routing to two instances of one service, path/query preservation, 502 for an unavailable selected instance, and successful selection on the following request. No performance benchmark was run.
+
+### Manual live Round Robin demonstration
+
+This live demonstration is separate from the automated Go tests and is not a performance benchmark.
+
+- Gateway: `localhost:8080`.
+- Product Service instances: `localhost:8001` and `localhost:8011`, configured with `PRODUCT_SERVICE_URLS=http://localhost:8001,http://localhost:8011`.
+- Sent six sequential `GET /api/v1/products` requests through the gateway. The gateway logged all six.
+- Each Product Service instance received 3 requests, all with HTTP 200 responses. The observed 3:3 distribution matched Round Robin across two backends.
+- Both instances returned identical sample product data.
+- No throughput, latency, concurrency, or other performance measurements were collected. No health-aware routing, automatic failover, or adaptive routing was demonstrated.

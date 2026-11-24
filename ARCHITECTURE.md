@@ -1,10 +1,10 @@
 # IntelliGate Proposed Architecture
 
-**Status:** Phase 1 implements a static Go HTTP reverse proxy and three FastAPI services. Authentication, rate limiting, dynamic backend selection, databases, monitoring, and the other integrations described below remain proposed.
+**Status:** Phase 1 implements the Go HTTP reverse proxy and three FastAPI services. Phase 2A adds per-service Round Robin selection across configured backend instances. Authentication, rate limiting, health-based selection, adaptive routing, databases, monitoring, and the other integrations described below remain proposed.
 
 ## 1. High-level system architecture
 
-The Go gateway is the public entry point for client API traffic. In Phase 1, it statically proxies requests to the three Python FastAPI services using Go's standard HTTP reverse-proxy capabilities. Future phases may add gateway policies and service-owned domain APIs. Redis is designated for distributed rate-limit state; PostgreSQL for persistent application data and selected configuration. Prometheus/Grafana, Locust, the dashboard, and anomaly-detection component remain planned.
+The Go gateway is the public entry point for client API traffic. It proxies requests to configured Python FastAPI backend instances using Go's standard HTTP reverse-proxy capabilities and selects an instance round-robin within each service pool. Future phases may add gateway policies and service-owned domain APIs. Redis is designated for distributed rate-limit state; PostgreSQL for persistent application data and selected configuration. Prometheus/Grafana, Locust, the dashboard, and anomaly-detection component remain planned.
 
 ```mermaid
 flowchart LR
@@ -23,9 +23,9 @@ flowchart LR
     Prometheus -. planned signals .-> Anomaly[Python + scikit-learn anomaly analysis]
 ```
 
-**Status note:** The gateway-to-service HTTP connections are implemented for the three configured local backends. Redis, PostgreSQL, Prometheus, Grafana, Locust, dashboard, and anomaly-detection connections remain proposed. No containerized deployment is included.
+**Status note:** Gateway-to-service HTTP connections and Round Robin selection across each configured local backend pool are implemented. Redis, PostgreSQL, Prometheus, Grafana, Locust, dashboard, and anomaly-detection connections remain proposed. No containerized deployment is included.
 
-### Phase 1 runtime configuration
+### Phase 1/2A runtime configuration
 
 | Component | Local address | Gateway route |
 | --- | --- | --- |
@@ -34,7 +34,7 @@ flowchart LR
 | Order Service | `http://localhost:8002` | `/api/v1/orders` and descendants |
 | User Service | `http://localhost:8003` | `/api/v1/users` and descendants |
 
-The gateway keeps the incoming path and query string unchanged when proxying. Each service also exposes `GET /` and `GET /health` directly on its local port.
+When the corresponding URL-list environment variable is unset, the gateway defaults to one backend per service at the listed address. Configure multiple backends using comma-separated full URLs in `PRODUCT_SERVICE_URLS`, `ORDER_SERVICE_URLS`, and `USER_SERVICE_URLS`. Additional port values are chosen by the local operator; the table shows existing defaults, not a required multi-instance port layout. The gateway keeps the incoming path and query string unchanged when proxying. Each service also exposes `GET /` and `GET /health` directly on its local port.
 
 ## 2. Component responsibilities
 
@@ -46,10 +46,11 @@ Beyond the Phase 1 behavior below, the gateway is planned to:
 - Log each request method and path, without query parameters (implemented).
 - Return `404 Not Found` for unmatched paths and `502 Bad Gateway` when a backend cannot be reached (implemented).
 - Authenticate protected clients and apply per-client rate limits.
-- Select eligible backend instances using the configured balancing policy.
+- Select a configured backend instance round-robin within each service pool (implemented in Phase 2A).
+- Select only healthy instances using an adaptive policy (planned; not implemented).
 - Reverse-proxy requests and responses with appropriate timeouts and error handling.
 - Gather latency, request, health, and circuit-breaker metrics.
-- Expose health, readiness, and Prometheus metrics endpoints.
+- Expose gateway `GET /health` (implemented); readiness and Prometheus metrics endpoints remain planned.
 - Exclude unhealthy or open-circuit instances and support controlled recovery.
 
 The `proxy` and `router` packages under `gateway/internal/` are implemented. The `middleware`, `health`, `circuitbreaker`, and `metrics` directories remain planned boundaries.
@@ -77,18 +78,19 @@ Each service will own its domain API. Service-level validation and persistence d
 
 ## 3. Request lifecycle
 
-The Phase 1 request path is:
+The Phase 2A request path is:
 
 1. Receive an HTTP request at port 8080.
 2. Match the request path to one of the three service prefixes; return 404 if none matches.
-3. Proxy the request with its original path and query to the mapped service; return 502 if the backend is unavailable.
-4. Log the method and path without query parameters.
+3. Select the next configured instance for that service under a short mutex lock.
+4. Proxy the request with its original path and query; return 502 if the selected backend is unavailable.
+5. Log the method and path without query parameters.
 
 The following extended path remains proposed:
 
 1. Handle gateway health/readiness/metrics paths separately from protected service routes.
 2. Validate request metadata, authenticate protected clients, and apply the client's distributed rate limit.
-3. Obtain eligible backends, select an instance using the configured policy, and proxy the request.
+3. Obtain healthy backends, select an instance using the configured adaptive policy, and proxy the request.
 4. Record request outcome, latency, health, and circuit-breaker signals.
 
 No retry policy or explicit upstream timeout is configured in Phase 1. Additional middleware, error schemas, and timeout policy remain to be defined. Automatic retries are not assumed.
@@ -115,7 +117,7 @@ sequenceDiagram
     P->>G: Scrape metrics endpoint
 ```
 
-The diagram represents intended later-phase interactions except for service-route matching and HTTP proxying, which are implemented in Phase 1.
+The diagram represents intended later-phase interactions except for service-route matching, HTTP proxying, and per-service Round Robin selection, which are implemented. Phase 2A does not probe backend health, skip an unavailable instance, or retry a failed request: the selected instance's proxy error returns 502, and subsequent requests continue round-robin selection.
 
 ## 4. API key authentication flow
 
@@ -127,32 +129,34 @@ The planned policy is a token bucket per client, with Redis holding shared state
 
 ## 6. Routing and load balancing
 
-### Round Robin baseline
+### Round Robin baseline (implemented in Phase 2A)
 
-The baseline will cycle over eligible backend instances for a service. Health and circuit-breaker eligibility will constrain the candidate set. The implementation must define behavior when the set is empty and when membership changes; no specific behavior is claimed as implemented.
+Each service has its own selector over its configured backend handler list. For each request, the selector locks briefly, returns the handler at its cursor, advances the cursor modulo the configured pool size, and unlocks before proxying. Pool configuration is static for the gateway process lifetime; an empty list is rejected during startup. The selector does not perform health checks or remove unavailable instances. A transport failure to the chosen instance returns the existing 502 response; it does not retry another instance. The next request advances normally.
 
 ### Adaptive Least-Loaded
 
-The adaptive policy will select an eligible instance using a measured load signal rather than fixed rotation. It should account for current in-flight requests and latency signals, while ensuring stale latency measurements do not unfairly penalize a backend indefinitely. The actual scoring formula, coefficients, and tie-breaking policy remain open implementation decisions for Phase 2. Measurements must be collected consistently to avoid giving either policy an unfair advantage.
+The adaptive policy will select an eligible instance using a measured load signal rather than fixed rotation. It should account for current in-flight requests and latency signals, while ensuring stale latency measurements do not unfairly penalize a backend indefinitely. The actual scoring formula, coefficients, and tie-breaking policy remain open implementation decisions for a later phase. Measurements must be collected consistently to avoid giving either policy an unfair advantage.
 
 ```mermaid
 flowchart TD
     Start[Incoming service request] --> Pool[Get configured instances]
-    Pool --> Filter[Filter unhealthy and circuit-ineligible instances]
+    Pool --> Policy{Selected policy}
+    Policy -->|Round Robin implemented| RR[Advance per-service cursor]
+    RR --> RRChoice[Choose next configured instance]
+    Policy -->|Adaptive Least-Loaded planned| Filter[Filter unhealthy and circuit-ineligible instances]
     Filter --> Empty{Any eligible instances?}
     Empty -->|No| Fail[Return gateway unavailable response]
-    Empty -->|Yes| Policy{Selected policy}
-    Policy -->|Round Robin| RR[Advance shared or local rotation position]
-    RR --> RRChoice[Choose next eligible instance]
-    Policy -->|Adaptive Least-Loaded| Signals[Read current load and EWMA signals]
+    Empty -->|Yes| Signals[Read current load and EWMA signals]
     Signals --> Score[Rank eligible instances using configured score]
     Score --> AdaptiveChoice[Choose lowest-scored instance]
-    RRChoice --> Proxy[Proxy request and observe outcome]
+    RRChoice --> Proxy[Proxy request]
     AdaptiveChoice --> Proxy
-    Proxy --> Update[Update in-flight, latency, health, and metrics signals]
+    Proxy --> Failure{Backend unavailable?}
+    Failure -->|Yes| BadGateway[Return 502; no retry]
+    Failure -->|No| Response[Return backend response]
 ```
 
-The empty-pool response and state synchronization approach are proposed behaviors requiring implementation and tests.
+Round Robin is implemented without health filtering. The health-aware adaptive branch is a proposed later-phase design.
 
 ## 7. EWMA latency tracking
 
@@ -191,6 +195,6 @@ A Python component using scikit-learn is planned to explore anomalies in aggrega
 
 ## 12. Architectural decisions and open decisions
 
-**Fixed decisions:** Go gateway; standard-library reverse-proxy capabilities; FastAPI services; Redis-backed distributed rate-limit state; PostgreSQL for persistent records/configuration; Prometheus and Grafana; Locust; Round Robin baseline compared with Adaptive Least-Loaded.
+**Fixed decisions:** Go gateway; standard-library reverse-proxy capabilities; FastAPI services; per-service Round Robin across configured backend URLs; Redis-backed distributed rate-limit state; PostgreSQL for persistent records/configuration; Prometheus and Grafana; Locust; future comparison with Adaptive Least-Loaded.
 
-**Open decisions:** API error formats; routing score and EWMA parameters; health thresholds and probe policy; circuit-breaker scope and thresholds; Redis failure mode; configuration schema and ownership; auth key lifecycle and admin authorization; metrics names and cardinality; dashboard interaction; anomaly model and operation mode.
+**Open decisions:** Additional local backend port assignments; runtime pool reload; routing score and EWMA parameters; health thresholds and probe policy; circuit-breaker scope and thresholds; Redis failure mode; auth key lifecycle and admin authorization; metrics names and cardinality; dashboard interaction; anomaly model and operation mode.

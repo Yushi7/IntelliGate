@@ -1,6 +1,6 @@
 # Performance Evaluation Methodology
 
-**Status:** Proposed methodology only. No experiments have been conducted and no results are claimed.
+**Status:** Proposed benchmark methodology. A limited manual Round Robin demonstration is recorded below; no performance benchmark results are claimed.
 
 ## Research question
 
@@ -34,9 +34,26 @@ Avoid changing multiple independent variables between comparison runs. Repeat ru
 
 Scenario-specific values, instance counts, and duration will be set after implementation and recorded with the actual run.
 
+## Phase 2A live Round Robin demonstration
+
+This was a manual routing demonstration, not an automated test or a performance benchmark.
+
+- Gateway: `localhost:8080`
+- Product Service instance 1: `localhost:8001`
+- Product Service instance 2: `localhost:8011`
+- Configuration: `PRODUCT_SERVICE_URLS=http://localhost:8001,http://localhost:8011`
+- Request sequence: six sequential `GET /api/v1/products` requests sent through the gateway.
+- Instance 1 received 3 requests; all returned HTTP 200.
+- Instance 2 received 3 requests; all returned HTTP 200.
+- The gateway logged all six incoming requests.
+- Observed distribution was 3:3, matching Round Robin with two configured backends.
+- Both instances returned identical sample product data.
+
+No throughput, latency, concurrency, or other performance measurements were taken. This demonstration does not establish health-aware routing, automatic failover, or adaptive routing.
+
 ## Result tables
 
-All values below are **pending**. Populate only from completed, documented experiments.
+Performance benchmark values below remain **pending**. The manual demonstration above is not a benchmark result. Populate these tables only from completed, documented benchmark runs.
 
 | Policy / scenario | Throughput (req/s) | Average (ms) | p50 (ms) | p95 (ms) | p99 (ms) | Error rate |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |

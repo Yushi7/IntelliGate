@@ -4,7 +4,7 @@
 
 IntelliGate is an API gateway and demonstration environment for routing traffic to an e-commerce application's Product, Order, and User services. The project is being built to explore secure client access, traffic management, service resilience, and observability in a modular microservices system.
 
-> **Phase 1 status:** The Go gateway and three FastAPI demonstration services are implemented with static HTTP reverse-proxy routing. Authentication, rate limiting, load balancing, persistence, monitoring, dashboard, and deployment features remain planned.
+> **Phase 2A status:** The Go gateway and three FastAPI demonstration services are implemented. The gateway uses configurable, per-service Round Robin reverse-proxy pools. Authentication, rate limiting, health-based backend selection, adaptive routing, persistence, monitoring, dashboard, and deployment features remain planned.
 
 ## Problem
 
@@ -23,10 +23,11 @@ Microservice applications need a consistent entry point to authenticate clients,
 | Capability | Status |
 | --- | --- |
 | Go gateway with static service routing and reverse proxy | Implemented in Phase 1 |
+| Per-service Round Robin across configured backend instances | Implemented in Phase 2A |
 | Gateway and service tests | Implemented in Phase 1 |
 | API key authentication | Planned |
 | Per-client token bucket rate limiting backed by Redis | Planned |
-| Round Robin baseline routing | Planned |
+| Round Robin baseline routing | Implemented in Phase 2A |
 | Adaptive least-loaded routing | Planned |
 | EWMA backend latency tracking | Planned |
 | Backend health monitoring and recovery | Planned |
@@ -40,7 +41,7 @@ Microservice applications need a consistent entry point to authenticate clients,
 
 ## Architecture
 
-Clients send service requests to the Go gateway on port 8080. It statically routes the three service prefixes to FastAPI backends on ports 8001–8003 and preserves the request path and query. This phase does not authenticate, rate-limit, balance, or persist requests. Redis is designated for distributed rate-limit state; PostgreSQL for persistent records and configuration; Prometheus and Grafana for metrics and visualization. These integrations remain planned. See [ARCHITECTURE.md](./ARCHITECTURE.md) for current and proposed behavior.
+Clients send service requests to the Go gateway on port 8080. It routes the three service prefixes to configured FastAPI backend pools, selecting instances sequentially per service while preserving the request path and query. The defaults remain ports 8001–8003. The gateway does not health-check or retry backends. Redis, PostgreSQL, Prometheus, and Grafana integrations remain planned. See [ARCHITECTURE.md](./ARCHITECTURE.md) for current and proposed behavior.
 
 ## Technology stack
 
@@ -71,6 +72,7 @@ IntelliGate/
 │   ├── go.mod
 │   ├── cmd/gateway/main.go
 │   └── internal/
+│       ├── balancer/   # Round Robin
 │       ├── proxy/      # implemented
 │       ├── router/     # implemented
 │       ├── middleware/ # planned
@@ -106,10 +108,11 @@ Phase 0 created the directory structure; Phase 1 adds gateway and service source
 | --- | --- | --- |
 | 0 | Initialize structure, scope, architecture, API plan, and verification strategy | Complete |
 | 1 | Implement the foundational Go gateway and service communication | Implemented; automated tests included |
-| Later | Add authentication, rate limiting, routing algorithms, health/resilience, and metrics | Pending |
+| 2A | Add Round Robin selection across configured backend instances | Implemented; tests included |
+| Later | Add authentication, rate limiting, adaptive routing, health/resilience, and metrics | Pending |
 | Later | Add dashboard, anomaly detection, load experiments, and deployment automation | Pending |
 
-Phase 1 implementation was approved and is recorded below. Later-phase work remains pending.
+Phase 1 and Phase 2A implementations were approved and are recorded below. Later-phase work remains pending.
 
 ## Run locally
 
@@ -122,12 +125,15 @@ python -m pip install -r services\product-service\requirements.txt
 python -m uvicorn main:app --app-dir services\product-service --host 127.0.0.1 --port 8001
 ```
 
-Repeat in separate terminals for Order (`services\order-service`, port `8002`) and User (`services\user-service`, port `8003`), using each service's own `.venv` and requirements file. Start the gateway in another terminal:
+Repeat in separate terminals for Order (`services\order-service`, port `8002`) and User (`services\user-service`, port `8003`), using each service's own `.venv` and requirements file. These ports are the single-backend defaults. To route a service across multiple instances, configure a comma-separated URL list before starting the gateway. For example, after starting a second Product Service on port `8011`:
 
 ```powershell
+$env:PRODUCT_SERVICE_URLS = "http://localhost:8001,http://localhost:8011"
 Set-Location gateway
 go run .\cmd\gateway
 ```
+
+The supported variables are `PRODUCT_SERVICE_URLS`, `ORDER_SERVICE_URLS`, and `USER_SERVICE_URLS`; each defaults to its existing localhost port when unset. The example secondary port is illustrative and not reserved by the project.
 
 The gateway listens on `http://localhost:8080`. Example: `Invoke-RestMethod http://localhost:8080/api/v1/products`.
 
@@ -151,6 +157,6 @@ There is no Docker deployment configuration. Run the gateway and services direct
 
 ## Current implementation status
 
-- **Implemented:** Phase 1 static Go reverse proxy, three FastAPI services, and focused unit/endpoint tests.
-- **Not implemented:** Authentication, rate limiting, dynamic/load-balanced routing, health-based backend selection, circuit breaking, database/cache integration, monitoring, dashboard, load tests, Docker configuration, and CI/CD workflows.
+- **Implemented:** Phase 1 Go reverse proxy and three FastAPI services; Phase 2A per-service Round Robin across configured backends.
+- **Not implemented:** Authentication, rate limiting, health-based backend selection, adaptive routing, circuit breaking, database/cache integration, monitoring, dashboard, load tests, Docker configuration, and CI/CD workflows.
 - **Verification:** Current test and manual integration procedures are recorded in [TESTING.md](./TESTING.md); actual run results are recorded in [DEVELOPMENT_LOG.md](./DEVELOPMENT_LOG.md).
