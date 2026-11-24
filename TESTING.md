@@ -1,6 +1,6 @@
 # Testing Strategy
 
-**Status:** Phase 1 includes Go router/proxy tests and pytest service endpoint tests. Phase 2A and 2B include Go Round Robin, active health-check, and gateway integration tests. Phase 3A adds timeout configuration and upstream proxy timeout tests. Tests for later features remain planned.
+**Status:** Phase 1 includes Go router/proxy tests and pytest service endpoint tests. Phase 2A and 2B include Go Round Robin, active health-check, and gateway integration tests. Phase 3A adds timeout configuration and proxy timeout tests. Phase 3B adds circuit-breaker state, selector, proxy-outcome, and configuration tests.
 
 ## Principles
 
@@ -12,7 +12,7 @@
 
 ## Go unit testing
 
-Use the Go standard `testing` package for gateway packages. Phase 2B tests healthy-only selection, distribution and wraparound among healthy instances, all-unhealthy 503, recovery, concurrent selection/health updates, concurrent probes, probe statuses/timeouts/connection failures, periodic recovery, cancellation, path/query preservation, and existing 404/502 behavior. Phase 3A tests default/custom timeout parsing, invalid/zero/negative values, timely upstream responses, timeout-to-504 mapping, and that a slow request does not block a concurrent request. Existing 404, 502, 503, and path/query tests provide regression coverage. Authentication, token-bucket behavior, adaptive scoring, EWMA, circuit breakers, and metrics remain planned.
+Use the Go standard `testing` package for gateway packages. Phase 2B tests health-aware selection and probing. Phase 3A tests timeout configuration, timely/timed-out upstreams, 504 mapping, concurrent request handling, and existing error/path behavior. Phase 3B tests breaker defaults and config validation, consecutive failure threshold and reset, cooldown, HALF-OPEN admission limits, successful close, failed reopen, stale permits, cancellation, concurrent outcomes, backend isolation, Round Robin exclusion/re-entry, health-probe independence, and gateway-vs-application response classification. Existing 404, 502, 503, 504, and path/query tests provide regression coverage. Authentication, token-bucket behavior, adaptive scoring, EWMA, and metrics remain planned.
 
 ## FastAPI testing with Pytest
 
@@ -174,11 +174,11 @@ Test token consumption, refill timing, bucket capacity, isolation between client
 
 ## Load-balancing testing
 
-For Phase 2A/2B Round Robin, validate sequential selection, wraparound, even distribution among healthy configured instances, concurrency safety, exclusion of failed probes, recovery re-entry, all-unhealthy 503, and 502 for a backend that fails between probes. Probe failures—not application response codes—change health. For future Adaptive Least-Loaded routing, validate scoring with controlled load/latency inputs, deterministic ties, and changes as signals update.
+For Phase 2A/2B/3B routing, validate sequential selection, wraparound, distribution among healthy breaker-admitted instances, concurrency safety, exclusion after health failure or breaker open, half-open recovery re-entry, all-ineligible 503, and 502/504 for attempted upstream failures. Probe failures—not application response codes—change health; breaker outcomes come from upstream transport/body events, not application status codes. For future Adaptive Least-Loaded routing, validate scoring with controlled load/latency inputs, deterministic ties, and changes as signals update.
 
-## Circuit breaker testing
+## Circuit breaker testing (implemented in Phase 3B)
 
-Verify Closed-to-Open behavior at the configured threshold, rejection/fallback behavior while Open, Half-Open transition after cooldown, successful closure, failed probe reopening, and isolation between intended breaker scopes. Test concurrent requests around transitions.
+The Go tests use an injected clock for deterministic threshold, cooldown, HALF-OPEN, failure/recovery, and stale-permit transitions. Concurrent trial admission is checked with synchronized goroutines. Integration tests verify independent per-instance breakers, Round Robin exclusion and re-entry, that successful health probes do not close breakers, application 4xx/5xx responses do not count as failures, and gateway-generated transport errors do. A client cancellation releases a trial without counting as an upstream failure.
 
 ## Performance testing
 
@@ -190,4 +190,4 @@ Inject controlled backend failure, latency, and restart/recovery events in a loc
 
 ## Current status
 
-Phase 1 service tests and Phase 2A/2B Go routing, health-check, and simulated integration tests are implemented. The manual integration procedure above exercises live local routing; record its result in [DEVELOPMENT_LOG.md](./DEVELOPMENT_LOG.md) only after running it. Tests for authentication, rate limiting, databases, adaptive routing, monitoring, and circuit breakers are not implemented.
+Phase 1 service tests and Phase 2A/2B/3A/3B Go routing, health-check, timeout, circuit-breaker, and simulated integration tests are implemented. The manual integration procedure above exercises live local routing and upstream timeouts; it has not been run as part of Phase 3B. Record manual results in [DEVELOPMENT_LOG.md](./DEVELOPMENT_LOG.md) only after running them. Tests for authentication, rate limiting, databases, adaptive routing, and monitoring are not implemented.

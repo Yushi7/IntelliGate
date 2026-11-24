@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"intelligate/gateway/internal/circuitbreaker"
 	"intelligate/gateway/internal/health"
 	"intelligate/gateway/internal/proxy"
 )
@@ -170,6 +171,77 @@ func TestUpstreamTimeoutFromEnvRejectsInvalidOrNonPositiveDuration(t *testing.T)
 	}
 }
 
+func TestCircuitBreakerConfigFromEnvUsesDefaultsWhenUnset(t *testing.T) {
+	unsetEnvironment(t,
+		breakerFailureThresholdEnv,
+		breakerOpenCooldownEnv,
+		breakerHalfOpenMaxRequestsEnv,
+		breakerHalfOpenSuccessThresholdEnv,
+	)
+
+	config, err := circuitBreakerConfigFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := circuitbreaker.DefaultConfig(); config != want {
+		t.Fatalf("config = %+v, want defaults %+v", config, want)
+	}
+}
+
+func TestCircuitBreakerConfigFromEnvAcceptsOverrides(t *testing.T) {
+	t.Setenv(breakerFailureThresholdEnv, "7")
+	t.Setenv(breakerOpenCooldownEnv, "12s")
+	t.Setenv(breakerHalfOpenMaxRequestsEnv, "2")
+	t.Setenv(breakerHalfOpenSuccessThresholdEnv, "3")
+
+	config, err := circuitBreakerConfigFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := circuitbreaker.Config{
+		FailureThreshold:         7,
+		OpenCooldown:             12 * time.Second,
+		HalfOpenMaxRequests:      2,
+		HalfOpenSuccessThreshold: 3,
+	}
+	if config != want {
+		t.Fatalf("config = %+v, want %+v", config, want)
+	}
+}
+
+func TestCircuitBreakerConfigFromEnvRejectsInvalidValues(t *testing.T) {
+	unsetEnvironment(t,
+		breakerFailureThresholdEnv,
+		breakerOpenCooldownEnv,
+		breakerHalfOpenMaxRequestsEnv,
+		breakerHalfOpenSuccessThresholdEnv,
+	)
+	tests := []struct {
+		envName string
+		value   string
+	}{
+		{envName: breakerFailureThresholdEnv, value: "invalid"},
+		{envName: breakerFailureThresholdEnv, value: "0"},
+		{envName: breakerFailureThresholdEnv, value: "-1"},
+		{envName: breakerOpenCooldownEnv, value: "invalid"},
+		{envName: breakerOpenCooldownEnv, value: "0s"},
+		{envName: breakerOpenCooldownEnv, value: "-1s"},
+		{envName: breakerHalfOpenMaxRequestsEnv, value: "0"},
+		{envName: breakerHalfOpenSuccessThresholdEnv, value: "-1"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.envName+"="+test.value, func(t *testing.T) {
+			t.Setenv(test.envName, test.value)
+			if _, err := circuitBreakerConfigFromEnv(); err == nil {
+				t.Fatal("circuitBreakerConfigFromEnv() error = nil, want invalid config error")
+			} else if !strings.Contains(err.Error(), test.envName) {
+				t.Errorf("error %q does not identify %s", err, test.envName)
+			}
+		})
+	}
+}
+
 func TestGatewayHealthAwareRoutingRecoveryAndLiveness(t *testing.T) {
 	firstServer, first := newProductTestBackend(t, "first")
 	defer firstServer.Close()
@@ -177,7 +249,12 @@ func TestGatewayHealthAwareRoutingRecoveryAndLiveness(t *testing.T) {
 	defer secondServer.Close()
 	t.Setenv("PRODUCT_SERVICE_URLS", firstServer.URL+","+secondServer.URL)
 
-	productSelector, productBackends, err := newServiceProxy("PRODUCT_SERVICE_URLS", "http://localhost:8001", time.Second)
+	productSelector, productBackends, err := newServiceProxy(
+		"PRODUCT_SERVICE_URLS",
+		"http://localhost:8001",
+		time.Second,
+		circuitbreaker.DefaultConfig(),
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -255,7 +332,12 @@ func TestGatewayPreserves502ForBackendUnreachableAfterHealthCheck(t *testing.T) 
 	}))
 	t.Setenv("PRODUCT_SERVICE_URLS", backend.URL)
 
-	selector, targets, err := newServiceProxy("PRODUCT_SERVICE_URLS", "http://localhost:8001", time.Second)
+	selector, targets, err := newServiceProxy(
+		"PRODUCT_SERVICE_URLS",
+		"http://localhost:8001",
+		time.Second,
+		circuitbreaker.DefaultConfig(),
+	)
 	if err != nil {
 		backend.Close()
 		t.Fatal(err)
@@ -312,4 +394,25 @@ func performProductRequest(handler http.Handler) *httptest.ResponseRecorder {
 		nil,
 	))
 	return recorder
+}
+
+func unsetEnvironment(t *testing.T, names ...string) {
+	t.Helper()
+	previous := make(map[string]string, len(names))
+	wasSet := make(map[string]bool, len(names))
+	for _, name := range names {
+		previous[name], wasSet[name] = os.LookupEnv(name)
+		if err := os.Unsetenv(name); err != nil {
+			t.Fatalf("unset %s: %v", name, err)
+		}
+	}
+	t.Cleanup(func() {
+		for _, name := range names {
+			if wasSet[name] {
+				_ = os.Setenv(name, previous[name])
+			} else {
+				_ = os.Unsetenv(name)
+			}
+		}
+	})
 }

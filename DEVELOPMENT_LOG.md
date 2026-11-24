@@ -134,3 +134,48 @@ This live demonstration is separate from the automated Go tests and is not a per
 - `git diff --check`: passed.
 - Tests cover default/custom/invalid timeout configuration; positive-timeout validation; timely upstream responses; 504 on timeout; an independent concurrent request completing while another request times out; and existing 502, 503, and path/query behavior.
 - The documented manual timeout procedure was not run. No performance benchmark or race-detector result is claimed.
+
+## Phase 3B per-backend circuit breakers
+
+**Status:** Implemented and verified with automated Go tests. No commit was created.
+
+### Implemented
+
+- Added a reusable circuit-breaker state machine with independent instances per configured backend. Defaults are 5 consecutive qualifying failures, a 10-second OPEN cooldown, one concurrent HALF-OPEN trial, and one successful trial required to close.
+- Added validated startup overrides: `INTELLIGATE_CIRCUIT_BREAKER_FAILURE_THRESHOLD`, `INTELLIGATE_CIRCUIT_BREAKER_OPEN_COOLDOWN`, `INTELLIGATE_CIRCUIT_BREAKER_HALF_OPEN_MAX_REQUESTS`, and `INTELLIGATE_CIRCUIT_BREAKER_HALF_OPEN_SUCCESS_THRESHOLD`.
+- Integrated breaker admission with health-aware Round Robin. Unhealthy backends, OPEN breakers, and full HALF-OPEN trial slots are excluded; if no backend is eligible the gateway returns 503. Health flags and breaker state remain independent, and successful health probes do not close breakers.
+- Added per-request permits and proxy transport/body observation. Upstream transport errors and timed-out responses count as failures; client cancellations abandon permits. Complete upstream responses, including application 4xx/5xx and application-originated 502/504, are transport successes. The gateway's own 502/504 errors count as upstream failures.
+- Updated README, architecture, API, and testing documentation. No automatic retries, external dependencies, or performance claims were added.
+
+### Live integration verification
+
+- Temporary Python backend on port `8091`.
+- Demo settings: `1s` upstream timeout, failure threshold `2`, `60s` OPEN cooldown.
+- Backend health remained HTTP 200 during product endpoint failures.
+- Two product requests returned 504.
+- The next request returned 503 (circuit OPEN).
+- Backend was restored to healthy mode.
+- After cooldown, HALF-OPEN trial returned 200.
+- Subsequent product request returned 200.
+- Gateway `/health` remained 200.
+
+### Verification
+
+- `gofmt` completed for all changed Go files.
+- `go test ./...` from `gateway`: passed for `cmd/gateway`, `internal/balancer`, `internal/circuitbreaker`, `internal/health`, `internal/proxy`, and `internal/router`.
+- `go test -count=10 ./internal/circuitbreaker`: passed.
+- `go test -count=5 ./internal/balancer`: passed.
+- Automated tests cover configuration validation, state transitions, cooldown and trial limits, cancellation, stale permits, concurrency, backend isolation, health-check independence, application-status classification, and 502/503/504 behavior.
+- `git diff --check`: passed. Separate manual live circuit-breaker verification is recorded below. No performance benchmark or race-detector result is claimed.
+
+### Live integration verification
+
+- Used a temporary controllable Python backend on port 8091.
+- Demo configuration: 1-second upstream timeout, failure threshold of 2, and OPEN cooldown of 60 seconds.
+- The backend health endpoint continued returning HTTP 200 while product requests were deliberately delayed.
+- Two consecutive product requests returned HTTP 504.
+- The next product request returned HTTP 503 because the circuit was OPEN.
+- Restored the backend to healthy mode.
+- After the cooldown, the HALF-OPEN trial returned HTTP 200.
+- The subsequent product request also returned HTTP 200, confirming recovery.
+- Gateway `GET /health` continued returning HTTP 200.

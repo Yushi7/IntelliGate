@@ -17,12 +17,19 @@ import (
 	"time"
 
 	"intelligate/gateway/internal/balancer"
+	"intelligate/gateway/internal/circuitbreaker"
 	"intelligate/gateway/internal/health"
 	"intelligate/gateway/internal/proxy"
 	"intelligate/gateway/internal/router"
 )
 
-const upstreamTimeoutEnv = "INTELLIGATE_UPSTREAM_TIMEOUT"
+const (
+	upstreamTimeoutEnv                 = "INTELLIGATE_UPSTREAM_TIMEOUT"
+	breakerFailureThresholdEnv         = "INTELLIGATE_CIRCUIT_BREAKER_FAILURE_THRESHOLD"
+	breakerOpenCooldownEnv             = "INTELLIGATE_CIRCUIT_BREAKER_OPEN_COOLDOWN"
+	breakerHalfOpenMaxRequestsEnv      = "INTELLIGATE_CIRCUIT_BREAKER_HALF_OPEN_MAX_REQUESTS"
+	breakerHalfOpenSuccessThresholdEnv = "INTELLIGATE_CIRCUIT_BREAKER_HALF_OPEN_SUCCESS_THRESHOLD"
+)
 
 func main() {
 	if err := runGateway(); err != nil {
@@ -35,16 +42,20 @@ func runGateway() error {
 	if err != nil {
 		return err
 	}
+	breakerConfig, err := circuitBreakerConfigFromEnv()
+	if err != nil {
+		return err
+	}
 
-	products, productBackends, err := newServiceProxy("PRODUCT_SERVICE_URLS", "http://localhost:8001", upstreamTimeout)
+	products, productBackends, err := newServiceProxy("PRODUCT_SERVICE_URLS", "http://localhost:8001", upstreamTimeout, breakerConfig)
 	if err != nil {
 		return err
 	}
-	orders, orderBackends, err := newServiceProxy("ORDER_SERVICE_URLS", "http://localhost:8002", upstreamTimeout)
+	orders, orderBackends, err := newServiceProxy("ORDER_SERVICE_URLS", "http://localhost:8002", upstreamTimeout, breakerConfig)
 	if err != nil {
 		return err
 	}
-	users, userBackends, err := newServiceProxy("USER_SERVICE_URLS", "http://localhost:8003", upstreamTimeout)
+	users, userBackends, err := newServiceProxy("USER_SERVICE_URLS", "http://localhost:8003", upstreamTimeout, breakerConfig)
 	if err != nil {
 		return err
 	}
@@ -74,7 +85,7 @@ func runGateway() error {
 	return serveWithHealthChecks(ctx, server, checker)
 }
 
-func newServiceProxy(envName, defaultURL string, upstreamTimeout time.Duration) (*balancer.RoundRobin, []health.Backend, error) {
+func newServiceProxy(envName, defaultURL string, upstreamTimeout time.Duration, breakerConfig circuitbreaker.Config) (*balancer.RoundRobin, []health.Backend, error) {
 	urls, err := backendURLsFromEnv(envName, defaultURL)
 	if err != nil {
 		return nil, nil, err
@@ -82,18 +93,29 @@ func newServiceProxy(envName, defaultURL string, upstreamTimeout time.Duration) 
 
 	backends := make([]http.Handler, 0, len(urls))
 	proxies := make([]proxy.Backend, 0, len(urls))
+	breakers := make([]*circuitbreaker.Breaker, 0, len(urls))
 	for _, target := range urls {
 		backend, err := proxy.NewBackendWithTimeout(target, upstreamTimeout)
 		if err != nil {
 			return nil, nil, fmt.Errorf("%s: %w", envName, err)
 		}
+		breaker, err := circuitbreaker.New(breakerConfig)
+		if err != nil {
+			return nil, nil, fmt.Errorf("%s backend %d circuit breaker: %w", envName, len(proxies), err)
+		}
 		proxies = append(proxies, backend)
 		backends = append(backends, backend.Handler)
+		breakers = append(breakers, breaker)
 	}
 
 	selector, err := balancer.NewRoundRobin(backends...)
 	if err != nil {
 		return nil, nil, fmt.Errorf("%s: %w", envName, err)
+	}
+	for i, breaker := range breakers {
+		if err := selector.SetCircuitBreaker(i, breaker); err != nil {
+			return nil, nil, fmt.Errorf("%s backend %d circuit breaker: %w", envName, i, err)
+		}
 	}
 	healthBackends := make([]health.Backend, len(proxies))
 	for i, backend := range proxies {
@@ -125,6 +147,59 @@ func upstreamTimeoutFromEnv() (time.Duration, error) {
 		return 0, fmt.Errorf("%s must be greater than zero", upstreamTimeoutEnv)
 	}
 	return timeout, nil
+}
+
+func circuitBreakerConfigFromEnv() (circuitbreaker.Config, error) {
+	config := circuitbreaker.DefaultConfig()
+	var err error
+
+	config.FailureThreshold, err = positiveIntFromEnv(breakerFailureThresholdEnv, config.FailureThreshold)
+	if err != nil {
+		return circuitbreaker.Config{}, err
+	}
+	config.OpenCooldown, err = positiveDurationFromEnv(breakerOpenCooldownEnv, config.OpenCooldown)
+	if err != nil {
+		return circuitbreaker.Config{}, err
+	}
+	config.HalfOpenMaxRequests, err = positiveIntFromEnv(breakerHalfOpenMaxRequestsEnv, config.HalfOpenMaxRequests)
+	if err != nil {
+		return circuitbreaker.Config{}, err
+	}
+	config.HalfOpenSuccessThreshold, err = positiveIntFromEnv(breakerHalfOpenSuccessThresholdEnv, config.HalfOpenSuccessThreshold)
+	if err != nil {
+		return circuitbreaker.Config{}, err
+	}
+	return config, nil
+}
+
+func positiveIntFromEnv(envName string, defaultValue int) (int, error) {
+	value, configured := os.LookupEnv(envName)
+	if !configured {
+		return defaultValue, nil
+	}
+	number, err := strconv.Atoi(value)
+	if err != nil {
+		return 0, fmt.Errorf("%s must be a positive integer: %w", envName, err)
+	}
+	if number <= 0 {
+		return 0, fmt.Errorf("%s must be greater than zero", envName)
+	}
+	return number, nil
+}
+
+func positiveDurationFromEnv(envName string, defaultValue time.Duration) (time.Duration, error) {
+	value, configured := os.LookupEnv(envName)
+	if !configured {
+		return defaultValue, nil
+	}
+	duration, err := time.ParseDuration(value)
+	if err != nil {
+		return 0, fmt.Errorf("%s must be a valid duration: %w", envName, err)
+	}
+	if duration <= 0 {
+		return 0, fmt.Errorf("%s must be greater than zero", envName)
+	}
+	return duration, nil
 }
 
 func serveWithHealthChecks(ctx context.Context, server *http.Server, checker *health.Checker) error {

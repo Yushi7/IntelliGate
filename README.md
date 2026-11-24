@@ -4,7 +4,7 @@
 
 IntelliGate is an API gateway and demonstration environment for routing traffic to an e-commerce application's Product, Order, and User services. The project is being built to explore secure client access, traffic management, service resilience, and observability in a modular microservices system.
 
-> **Phase 3A status:** The Go gateway and three FastAPI demonstration services are implemented. The gateway uses configurable, per-service Round Robin pools with active health checks and a configurable upstream request timeout. Authentication, rate limiting, adaptive routing, persistence, monitoring, dashboard, and deployment features remain planned.
+> **Phase 3B status:** The Go gateway and three FastAPI demonstration services are implemented. The gateway uses configurable per-service Round Robin pools, active health checks, upstream request timeouts, and per-backend circuit breakers. Authentication, rate limiting, adaptive routing, persistence, monitoring, dashboard, and deployment features remain planned.
 
 ## Problem
 
@@ -26,6 +26,7 @@ Microservice applications need a consistent entry point to authenticate clients,
 | Per-service Round Robin across configured backend instances | Implemented in Phase 2A |
 | Active `/health` probes and health-aware Round Robin routing | Implemented in Phase 2B |
 | Configurable upstream request timeout | Implemented in Phase 3A; 5-second default |
+| Per-backend circuit breakers | Implemented in Phase 3B |
 | Gateway and service tests | Implemented in Phase 1 |
 | API key authentication | Planned |
 | Per-client token bucket rate limiting backed by Redis | Planned |
@@ -33,7 +34,7 @@ Microservice applications need a consistent entry point to authenticate clients,
 | Adaptive least-loaded routing | Planned |
 | EWMA backend latency tracking | Planned |
 | Backend health monitoring and recovery | Implemented in Phase 2B |
-| Circuit breaker | Planned |
+| Circuit breaker | Implemented in Phase 3B |
 | Prometheus metrics and Grafana dashboards | Planned |
 | Traffic anomaly detection using Python and scikit-learn | Planned |
 | Product, Order, and User FastAPI services | Implemented in Phase 1 |
@@ -43,7 +44,7 @@ Microservice applications need a consistent entry point to authenticate clients,
 
 ## Architecture
 
-Clients send service requests to the Go gateway on port 8080. It routes the three service prefixes to configured FastAPI backend pools and round-robins only among instances whose direct `/health` probe returned 2xx. Probes run every 5 seconds with a 2-second timeout. Upstream requests are bounded by 5 seconds by default; set `INTELLIGATE_UPSTREAM_TIMEOUT` to another positive Go duration (for example, `8s`). A timeout before upstream response headers yields 504; ordinary proxy failures yield 502, and all-unhealthy service pools yield 503. Requests are not retried. Gateway `GET /health` remains independent of backend state. Redis, PostgreSQL, Prometheus, and Grafana integrations remain planned. See [ARCHITECTURE.md](./ARCHITECTURE.md) for details.
+Clients send service requests to the Go gateway on port 8080. It round-robins among configured instances that pass direct `/health` checks and have an available circuit-breaker permit. Breakers are per instance: after 5 qualifying transport failures, an instance is excluded for a 10-second cooldown before a half-open trial is allowed. A failed trial reopens it; the configured number of complete upstream responses closes it. Configure thresholds with the `INTELLIGATE_CIRCUIT_BREAKER_*` environment variables. A 5-second upstream timeout is the default (`INTELLIGATE_UPSTREAM_TIMEOUT` overrides it); timeout before response headers returns 504, ordinary proxy failures return 502, and no eligible backend returns 503. Requests are not retried. Gateway `GET /health` remains independent of backend state. Redis, PostgreSQL, Prometheus, and Grafana integrations remain planned. See [ARCHITECTURE.md](./ARCHITECTURE.md) for details.
 
 ## Technology stack
 
@@ -79,7 +80,7 @@ IntelliGate/
 │       ├── router/     # implemented
 │       ├── middleware/ # planned
 │       ├── health/     # active backend probes
-│       ├── circuitbreaker/ # planned
+│       ├── circuitbreaker/ # per-backend circuit state
 │       └── metrics/    # planned
 ├── services/
 │   ├── product-service/{main.py,requirements.txt,test_main.py}
@@ -113,10 +114,11 @@ Phase 0 created the directory structure; Phase 1 adds gateway and service source
 | 2A | Add Round Robin selection across configured backend instances | Implemented; tests included |
 | 2B | Add active backend health checks and health-aware Round Robin | Implemented; tests included |
 | 3A | Add configurable upstream request timeouts | Implemented; tests included |
-| Later | Add authentication, rate limiting, adaptive routing, circuit breaking, and metrics | Pending |
+| 3B | Add per-backend circuit breakers | Implemented; tests included |
+| Later | Add authentication, rate limiting, adaptive routing, and metrics | Pending |
 | Later | Add dashboard, anomaly detection, load experiments, and deployment automation | Pending |
 
-Phase 1, Phase 2A, Phase 2B, and Phase 3A implementations were approved and are recorded below. Later-phase work remains pending.
+Phase 1, Phase 2A, Phase 2B, Phase 3A, and Phase 3B implementations were approved and are recorded below. Later-phase work remains pending.
 
 ## Run locally
 

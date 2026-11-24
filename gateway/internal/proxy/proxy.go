@@ -4,14 +4,19 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"time"
+
+	"intelligate/gateway/internal/circuitbreaker"
 )
 
 const DefaultUpstreamTimeout = 5 * time.Second
+
+var errGatewayUpstreamTimeout = errors.New("gateway upstream timeout")
 
 type Backend struct {
 	Handler   http.Handler
@@ -48,8 +53,12 @@ func NewBackendWithTimeout(target string, timeout time.Duration) (Backend, error
 	}
 
 	reverseProxy := httputil.NewSingleHostReverseProxy(backend)
-	reverseProxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, err error) {
-		if isTimeoutError(err) {
+	reverseProxy.Transport = breakerAwareTransport{next: http.DefaultTransport}
+	reverseProxy.ErrorHandler = func(w http.ResponseWriter, req *http.Request, err error) {
+		if isClientContextDone(req.Context()) {
+			return
+		}
+		if isGatewayUpstreamTimeout(req.Context()) || isTimeoutError(err) {
 			http.Error(w, "upstream request timed out", http.StatusGatewayTimeout)
 			return
 		}
@@ -65,12 +74,88 @@ func NewBackendWithTimeout(target string, timeout time.Duration) (Backend, error
 	healthURL.RawFragment = ""
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		ctx, cancel := context.WithTimeout(r.Context(), timeout)
+		ctx, cancel := withUpstreamTimeout(r.Context(), timeout)
 		defer cancel()
 		reverseProxy.ServeHTTP(w, r.WithContext(ctx))
 	})
 
 	return Backend{Handler: handler, HealthURL: &healthURL}, nil
+}
+
+type breakerAwareTransport struct {
+	next http.RoundTripper
+}
+
+func (t breakerAwareTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	response, err := t.next.RoundTrip(req)
+	permit := circuitbreaker.PermitFromContext(req.Context())
+	if permit == nil {
+		return response, err
+	}
+	if err != nil {
+		if isClientContextDone(req.Context()) {
+			permit.Abandon()
+		} else {
+			permit.Failure()
+		}
+		return response, err
+	}
+	if response == nil || response.Body == nil {
+		permit.Success()
+		return response, nil
+	}
+
+	response.Body = observedResponseBody{
+		ReadCloser: response.Body,
+		permit:     permit,
+		ctx:        req.Context(),
+	}
+	return response, nil
+}
+
+type observedResponseBody struct {
+	io.ReadCloser
+	permit *circuitbreaker.Permit
+	ctx    context.Context
+}
+
+func (b observedResponseBody) Read(buffer []byte) (int, error) {
+	count, err := b.ReadCloser.Read(buffer)
+	if err == nil {
+		return count, nil
+	}
+	if errors.Is(err, io.EOF) {
+		b.permit.Success()
+	} else if isClientContextDone(b.ctx) {
+		b.permit.Abandon()
+	} else {
+		b.permit.Failure()
+	}
+	return count, err
+}
+
+func (b observedResponseBody) Close() error {
+	err := b.ReadCloser.Close()
+	if isClientContextDone(b.ctx) {
+		b.permit.Abandon()
+	} else if isGatewayUpstreamTimeout(b.ctx) || err != nil {
+		b.permit.Failure()
+	} else {
+		b.permit.Abandon()
+	}
+	return err
+}
+
+func withUpstreamTimeout(parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	return context.WithTimeoutCause(parent, timeout, errGatewayUpstreamTimeout)
+}
+
+func isClientContextDone(ctx context.Context) bool {
+	return ctx.Err() != nil && !isGatewayUpstreamTimeout(ctx)
+}
+
+func isGatewayUpstreamTimeout(ctx context.Context) bool {
+	return errors.Is(context.Cause(ctx), errGatewayUpstreamTimeout)
 }
 
 func isTimeoutError(err error) bool {

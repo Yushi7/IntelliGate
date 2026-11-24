@@ -1,13 +1,18 @@
 package balancer
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
+	"intelligate/gateway/internal/circuitbreaker"
+	"intelligate/gateway/internal/health"
 	"intelligate/gateway/internal/proxy"
 	"intelligate/gateway/internal/router"
 )
@@ -312,6 +317,225 @@ func TestUnavailableBackendReturnsBadGatewayAndSelectionContinues(t *testing.T) 
 	handler.ServeHTTP(nextRequest, httptest.NewRequest(http.MethodGet, "/api/v1/products", nil))
 	if nextRequest.Code != http.StatusOK || nextRequest.Body.String() != "available" {
 		t.Fatalf("next request = status %d, body %q; want 200 and available backend", nextRequest.Code, nextRequest.Body.String())
+	}
+}
+
+func TestRoundRobinSkipsOpenBackendAndKeepsBreakersIndependent(t *testing.T) {
+	firstServer := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	firstURL := firstServer.URL
+	firstServer.Close()
+	var secondRequests atomic.Int32
+	secondServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		secondRequests.Add(1)
+		_, _ = fmt.Fprint(w, "second")
+	}))
+	defer secondServer.Close()
+
+	firstProxy, err := proxy.New(firstURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondProxy, err := proxy.New(secondServer.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	selector, err := NewRoundRobin(firstProxy, secondProxy)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	config := circuitbreaker.DefaultConfig()
+	config.FailureThreshold = 1
+	config.OpenCooldown = time.Hour
+	firstBreaker, err := circuitbreaker.New(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondBreaker, err := circuitbreaker.New(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := selector.SetCircuitBreaker(0, firstBreaker); err != nil {
+		t.Fatal(err)
+	}
+	if err := selector.SetCircuitBreaker(1, secondBreaker); err != nil {
+		t.Fatal(err)
+	}
+
+	firstRequest := httptest.NewRecorder()
+	selector.ServeHTTP(firstRequest, httptest.NewRequest(http.MethodGet, "/products", nil))
+	if firstRequest.Code != http.StatusBadGateway {
+		t.Fatalf("first request status = %d, want %d", firstRequest.Code, http.StatusBadGateway)
+	}
+	if got := firstBreaker.State(); got != circuitbreaker.StateOpen {
+		t.Fatalf("first backend breaker state = %s, want open", got)
+	}
+	if got := secondBreaker.State(); got != circuitbreaker.StateClosed {
+		t.Fatalf("second backend breaker state = %s, want closed", got)
+	}
+
+	for range 2 {
+		recorder := httptest.NewRecorder()
+		selector.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/products", nil))
+		if recorder.Code != http.StatusOK || recorder.Body.String() != "second" {
+			t.Fatalf("request to healthy instance = status %d, body %q; want 200 and second", recorder.Code, recorder.Body.String())
+		}
+	}
+	if got := secondRequests.Load(); got != 2 {
+		t.Fatalf("healthy backend received %d requests, want 2", got)
+	}
+}
+
+func TestOpenCircuitReturns503AndSuccessfulHealthProbeDoesNotCloseIt(t *testing.T) {
+	var applicationRequests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/health" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		applicationRequests.Add(1)
+		conn, _, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			t.Errorf("hijack application connection: %v", err)
+			return
+		}
+		_ = conn.Close()
+	}))
+	defer server.Close()
+
+	target, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backendProxy, err := proxy.New(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	selector, err := NewRoundRobin(backendProxy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := circuitbreaker.DefaultConfig()
+	config.FailureThreshold = 1
+	config.OpenCooldown = time.Hour
+	breaker, err := circuitbreaker.New(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := selector.SetCircuitBreaker(0, breaker); err != nil {
+		t.Fatal(err)
+	}
+	checker, err := health.NewChecker([]health.Backend{{
+		URL: target,
+		SetHealthy: func(healthy bool) error {
+			return selector.SetHealthy(0, healthy)
+		},
+	}}, time.Hour, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := checker.CheckNow(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	failed := httptest.NewRecorder()
+	selector.ServeHTTP(failed, httptest.NewRequest(http.MethodGet, "/products", nil))
+	if failed.Code != http.StatusBadGateway {
+		t.Fatalf("failed upstream status = %d, want %d", failed.Code, http.StatusBadGateway)
+	}
+	if got := breaker.State(); got != circuitbreaker.StateOpen {
+		t.Fatalf("breaker state after transport failure = %s, want open", got)
+	}
+
+	if err := checker.CheckNow(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := breaker.State(); got != circuitbreaker.StateOpen {
+		t.Fatalf("breaker state after successful health probe = %s, want open", got)
+	}
+
+	requestsBeforeRejection := applicationRequests.Load()
+	rejected := httptest.NewRecorder()
+	selector.ServeHTTP(rejected, httptest.NewRequest(http.MethodGet, "/products", nil))
+	if rejected.Code != http.StatusServiceUnavailable {
+		t.Fatalf("open-circuit status = %d, want %d", rejected.Code, http.StatusServiceUnavailable)
+	}
+	if got := applicationRequests.Load(); got != requestsBeforeRejection {
+		t.Fatalf("open-circuit rejection contacted backend: request count changed from %d to %d", requestsBeforeRejection, got)
+	}
+}
+
+func TestRecoveredBackendReentersAfterSuccessfulHalfOpenTrial(t *testing.T) {
+	var firstRequests atomic.Int32
+	first := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		permit := circuitbreaker.PermitFromContext(r.Context())
+		if permit == nil {
+			t.Error("first backend request has no circuit-breaker permit")
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		if firstRequests.Add(1) == 1 {
+			permit.Failure()
+			http.Error(w, "upstream unavailable", http.StatusBadGateway)
+			return
+		}
+		permit.Success()
+		_, _ = fmt.Fprint(w, "recovered")
+	})
+	second := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		permit := circuitbreaker.PermitFromContext(r.Context())
+		if permit == nil {
+			t.Error("second backend request has no circuit-breaker permit")
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		permit.Success()
+		_, _ = fmt.Fprint(w, "second")
+	})
+	selector, err := NewRoundRobin(first, second)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	config := circuitbreaker.DefaultConfig()
+	config.FailureThreshold = 1
+	config.OpenCooldown = time.Millisecond
+	firstBreaker, err := circuitbreaker.New(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondBreaker, err := circuitbreaker.New(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := selector.SetCircuitBreaker(0, firstBreaker); err != nil {
+		t.Fatal(err)
+	}
+	if err := selector.SetCircuitBreaker(1, secondBreaker); err != nil {
+		t.Fatal(err)
+	}
+
+	failed := httptest.NewRecorder()
+	selector.ServeHTTP(failed, httptest.NewRequest(http.MethodGet, "/", nil))
+	if failed.Code != http.StatusBadGateway {
+		t.Fatalf("initial response status = %d, want %d", failed.Code, http.StatusBadGateway)
+	}
+	other := httptest.NewRecorder()
+	selector.ServeHTTP(other, httptest.NewRequest(http.MethodGet, "/", nil))
+	if other.Code != http.StatusOK || other.Body.String() != "second" {
+		t.Fatalf("alternate backend response = status %d, body %q; want 200 from second", other.Code, other.Body.String())
+	}
+	time.Sleep(2 * config.OpenCooldown)
+	recovered := httptest.NewRecorder()
+	selector.ServeHTTP(recovered, httptest.NewRequest(http.MethodGet, "/", nil))
+	if recovered.Code != http.StatusOK || recovered.Body.String() != "recovered" {
+		t.Fatalf("half-open trial response = status %d, body %q; want recovered backend", recovered.Code, recovered.Body.String())
+	}
+	if got := firstBreaker.State(); got != circuitbreaker.StateClosed {
+		t.Fatalf("recovered breaker state = %s, want closed", got)
+	}
+	if got := firstRequests.Load(); got != 2 {
+		t.Fatalf("recovered backend received %d requests, want 2", got)
 	}
 }
 
