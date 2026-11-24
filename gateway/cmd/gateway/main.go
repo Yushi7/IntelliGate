@@ -22,6 +22,8 @@ import (
 	"intelligate/gateway/internal/router"
 )
 
+const upstreamTimeoutEnv = "INTELLIGATE_UPSTREAM_TIMEOUT"
+
 func main() {
 	if err := runGateway(); err != nil {
 		log.Fatal(err)
@@ -29,15 +31,20 @@ func main() {
 }
 
 func runGateway() error {
-	products, productBackends, err := newServiceProxy("PRODUCT_SERVICE_URLS", "http://localhost:8001")
+	upstreamTimeout, err := upstreamTimeoutFromEnv()
 	if err != nil {
 		return err
 	}
-	orders, orderBackends, err := newServiceProxy("ORDER_SERVICE_URLS", "http://localhost:8002")
+
+	products, productBackends, err := newServiceProxy("PRODUCT_SERVICE_URLS", "http://localhost:8001", upstreamTimeout)
 	if err != nil {
 		return err
 	}
-	users, userBackends, err := newServiceProxy("USER_SERVICE_URLS", "http://localhost:8003")
+	orders, orderBackends, err := newServiceProxy("ORDER_SERVICE_URLS", "http://localhost:8002", upstreamTimeout)
+	if err != nil {
+		return err
+	}
+	users, userBackends, err := newServiceProxy("USER_SERVICE_URLS", "http://localhost:8003", upstreamTimeout)
 	if err != nil {
 		return err
 	}
@@ -67,7 +74,7 @@ func runGateway() error {
 	return serveWithHealthChecks(ctx, server, checker)
 }
 
-func newServiceProxy(envName, defaultURL string) (*balancer.RoundRobin, []health.Backend, error) {
+func newServiceProxy(envName, defaultURL string, upstreamTimeout time.Duration) (*balancer.RoundRobin, []health.Backend, error) {
 	urls, err := backendURLsFromEnv(envName, defaultURL)
 	if err != nil {
 		return nil, nil, err
@@ -76,7 +83,7 @@ func newServiceProxy(envName, defaultURL string) (*balancer.RoundRobin, []health
 	backends := make([]http.Handler, 0, len(urls))
 	proxies := make([]proxy.Backend, 0, len(urls))
 	for _, target := range urls {
-		backend, err := proxy.NewBackend(target)
+		backend, err := proxy.NewBackendWithTimeout(target, upstreamTimeout)
 		if err != nil {
 			return nil, nil, fmt.Errorf("%s: %w", envName, err)
 		}
@@ -102,6 +109,22 @@ func newServiceProxy(envName, defaultURL string) (*balancer.RoundRobin, []health
 		}
 	}
 	return selector, healthBackends, nil
+}
+
+func upstreamTimeoutFromEnv() (time.Duration, error) {
+	value, configured := os.LookupEnv(upstreamTimeoutEnv)
+	if !configured {
+		return proxy.DefaultUpstreamTimeout, nil
+	}
+
+	timeout, err := time.ParseDuration(value)
+	if err != nil {
+		return 0, fmt.Errorf("%s must be a valid duration: %w", upstreamTimeoutEnv, err)
+	}
+	if timeout <= 0 {
+		return 0, fmt.Errorf("%s must be greater than zero", upstreamTimeoutEnv)
+	}
+	return timeout, nil
 }
 
 func serveWithHealthChecks(ctx context.Context, server *http.Server, checker *health.Checker) error {

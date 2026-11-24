@@ -114,3 +114,23 @@ This live demonstration is separate from the automated Go tests and is not a per
 - `go test -count=25 ./internal/health`: passed.
 - `go test -race ./...` could not complete because the available Windows MinGW compiler does not support the required 64-bit mode (`cc1.exe: sorry, unimplemented: 64-bit mode not compiled in`). Race detection is unverified.
 - No throughput, latency, concurrency-performance, or other benchmark results are claimed.
+
+## Phase 3A configurable upstream request timeouts
+
+**Status:** Implemented and verified with the Go test suite. No commit was created.
+
+### Implemented
+
+- Added `INTELLIGATE_UPSTREAM_TIMEOUT`, parsed once during gateway startup as a positive Go duration. It defaults to `5s`; malformed, zero, and negative values fail startup with an error naming the setting.
+- Configured each reverse proxy with an upstream deadline derived from the incoming request context. Health-check timing remains independent. No retries, circuit breakers, selector changes, or health-state changes were added.
+- Upstream timeout errors before response headers return `504 Gateway Timeout`; ordinary connection/proxy failures remain `502 Bad Gateway`, and all-unhealthy pools remain `503 Service Unavailable`.
+- The request deadline cancels upstream work without serializing other requests. If a timeout occurs after response headers have been sent, the HTTP status cannot be changed and the response may be truncated; responses remain streamed rather than buffered.
+- Updated README, architecture, API, and testing documentation with configuration, behavior, limitations, and a manual verification procedure.
+
+### Verification
+
+- `gofmt` completed for all changed Go files.
+- `go test ./...` from `gateway`: passed for `cmd/gateway`, `internal/balancer`, `internal/health`, `internal/proxy`, and `internal/router`.
+- `git diff --check`: passed.
+- Tests cover default/custom/invalid timeout configuration; positive-timeout validation; timely upstream responses; 504 on timeout; an independent concurrent request completing while another request times out; and existing 502, 503, and path/query behavior.
+- The documented manual timeout procedure was not run. No performance benchmark or race-detector result is claimed.

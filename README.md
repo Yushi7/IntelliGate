@@ -4,7 +4,7 @@
 
 IntelliGate is an API gateway and demonstration environment for routing traffic to an e-commerce application's Product, Order, and User services. The project is being built to explore secure client access, traffic management, service resilience, and observability in a modular microservices system.
 
-> **Phase 2B status:** The Go gateway and three FastAPI demonstration services are implemented. The gateway uses configurable, per-service Round Robin pools with active health checks. Authentication, rate limiting, adaptive routing, persistence, monitoring, dashboard, and deployment features remain planned.
+> **Phase 3A status:** The Go gateway and three FastAPI demonstration services are implemented. The gateway uses configurable, per-service Round Robin pools with active health checks and a configurable upstream request timeout. Authentication, rate limiting, adaptive routing, persistence, monitoring, dashboard, and deployment features remain planned.
 
 ## Problem
 
@@ -25,6 +25,7 @@ Microservice applications need a consistent entry point to authenticate clients,
 | Go gateway with static service routing and reverse proxy | Implemented in Phase 1 |
 | Per-service Round Robin across configured backend instances | Implemented in Phase 2A |
 | Active `/health` probes and health-aware Round Robin routing | Implemented in Phase 2B |
+| Configurable upstream request timeout | Implemented in Phase 3A; 5-second default |
 | Gateway and service tests | Implemented in Phase 1 |
 | API key authentication | Planned |
 | Per-client token bucket rate limiting backed by Redis | Planned |
@@ -42,7 +43,7 @@ Microservice applications need a consistent entry point to authenticate clients,
 
 ## Architecture
 
-Clients send service requests to the Go gateway on port 8080. It routes the three service prefixes to configured FastAPI backend pools and round-robins only among instances whose direct `/health` probe returned 2xx. Probes run every 5 seconds with a 2-second timeout. The defaults remain ports 8001–8003. If all instances for a service are unhealthy, the gateway returns 503; a selected backend that fails between probes returns 502. Requests are not retried. Gateway `GET /health` remains a liveness endpoint independent of backend state. Redis, PostgreSQL, Prometheus, and Grafana integrations remain planned. See [ARCHITECTURE.md](./ARCHITECTURE.md) for details.
+Clients send service requests to the Go gateway on port 8080. It routes the three service prefixes to configured FastAPI backend pools and round-robins only among instances whose direct `/health` probe returned 2xx. Probes run every 5 seconds with a 2-second timeout. Upstream requests are bounded by 5 seconds by default; set `INTELLIGATE_UPSTREAM_TIMEOUT` to another positive Go duration (for example, `8s`). A timeout before upstream response headers yields 504; ordinary proxy failures yield 502, and all-unhealthy service pools yield 503. Requests are not retried. Gateway `GET /health` remains independent of backend state. Redis, PostgreSQL, Prometheus, and Grafana integrations remain planned. See [ARCHITECTURE.md](./ARCHITECTURE.md) for details.
 
 ## Technology stack
 
@@ -111,10 +112,11 @@ Phase 0 created the directory structure; Phase 1 adds gateway and service source
 | 1 | Implement the foundational Go gateway and service communication | Implemented; automated tests included |
 | 2A | Add Round Robin selection across configured backend instances | Implemented; tests included |
 | 2B | Add active backend health checks and health-aware Round Robin | Implemented; tests included |
+| 3A | Add configurable upstream request timeouts | Implemented; tests included |
 | Later | Add authentication, rate limiting, adaptive routing, circuit breaking, and metrics | Pending |
 | Later | Add dashboard, anomaly detection, load experiments, and deployment automation | Pending |
 
-Phase 1, Phase 2A, and Phase 2B implementations were approved and are recorded below. Later-phase work remains pending.
+Phase 1, Phase 2A, Phase 2B, and Phase 3A implementations were approved and are recorded below. Later-phase work remains pending.
 
 ## Run locally
 
@@ -159,6 +161,6 @@ There is no Docker deployment configuration. Run the gateway and services direct
 
 ## Current implementation status
 
-- **Implemented:** Phase 1 Go reverse proxy and three FastAPI services; Phase 2A per-service Round Robin; Phase 2B health checks and health-aware selection.
+- **Implemented:** Phase 1 Go reverse proxy and three FastAPI services; Phase 2A per-service Round Robin; Phase 2B health checks and health-aware selection; Phase 3A configurable upstream request timeout.
 - **Not implemented:** Authentication, rate limiting, adaptive routing, circuit breaking, database/cache integration, monitoring, dashboard, load tests, Docker configuration, and CI/CD workflows.
 - **Verification:** Current test and manual integration procedures are recorded in [TESTING.md](./TESTING.md); actual run results are recorded in [DEVELOPMENT_LOG.md](./DEVELOPMENT_LOG.md).

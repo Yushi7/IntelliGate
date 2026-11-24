@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"intelligate/gateway/internal/health"
+	"intelligate/gateway/internal/proxy"
 )
 
 func TestHealthReturnsGatewayStatusWithoutProxying(t *testing.T) {
@@ -119,6 +120,56 @@ func TestBackendURLsFromEnvRejectsInvalidEntries(t *testing.T) {
 	}
 }
 
+func TestUpstreamTimeoutFromEnvUsesDefaultWhenUnset(t *testing.T) {
+	previous, wasSet := os.LookupEnv(upstreamTimeoutEnv)
+	if err := os.Unsetenv(upstreamTimeoutEnv); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if wasSet {
+			_ = os.Setenv(upstreamTimeoutEnv, previous)
+		} else {
+			_ = os.Unsetenv(upstreamTimeoutEnv)
+		}
+	})
+
+	timeout, err := upstreamTimeoutFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if timeout != proxy.DefaultUpstreamTimeout {
+		t.Fatalf("timeout = %s, want default %s", timeout, proxy.DefaultUpstreamTimeout)
+	}
+}
+
+func TestUpstreamTimeoutFromEnvAcceptsCustomDuration(t *testing.T) {
+	t.Setenv(upstreamTimeoutEnv, "1500ms")
+
+	timeout, err := upstreamTimeoutFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := 1500 * time.Millisecond; timeout != want {
+		t.Fatalf("timeout = %s, want %s", timeout, want)
+	}
+}
+
+func TestUpstreamTimeoutFromEnvRejectsInvalidOrNonPositiveDuration(t *testing.T) {
+	for _, value := range []string{"not-a-duration", "", "0s", "-1s"} {
+		t.Run(value, func(t *testing.T) {
+			t.Setenv(upstreamTimeoutEnv, value)
+
+			_, err := upstreamTimeoutFromEnv()
+			if err == nil {
+				t.Fatal("upstreamTimeoutFromEnv() error = nil, want invalid timeout error")
+			}
+			if !strings.Contains(err.Error(), upstreamTimeoutEnv) {
+				t.Errorf("error %q does not identify %s", err, upstreamTimeoutEnv)
+			}
+		})
+	}
+}
+
 func TestGatewayHealthAwareRoutingRecoveryAndLiveness(t *testing.T) {
 	firstServer, first := newProductTestBackend(t, "first")
 	defer firstServer.Close()
@@ -126,7 +177,7 @@ func TestGatewayHealthAwareRoutingRecoveryAndLiveness(t *testing.T) {
 	defer secondServer.Close()
 	t.Setenv("PRODUCT_SERVICE_URLS", firstServer.URL+","+secondServer.URL)
 
-	productSelector, productBackends, err := newServiceProxy("PRODUCT_SERVICE_URLS", "http://localhost:8001")
+	productSelector, productBackends, err := newServiceProxy("PRODUCT_SERVICE_URLS", "http://localhost:8001", time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -204,7 +255,7 @@ func TestGatewayPreserves502ForBackendUnreachableAfterHealthCheck(t *testing.T) 
 	}))
 	t.Setenv("PRODUCT_SERVICE_URLS", backend.URL)
 
-	selector, targets, err := newServiceProxy("PRODUCT_SERVICE_URLS", "http://localhost:8001")
+	selector, targets, err := newServiceProxy("PRODUCT_SERVICE_URLS", "http://localhost:8001", time.Second)
 	if err != nil {
 		backend.Close()
 		t.Fatal(err)

@@ -1,6 +1,6 @@
 # API Documentation
 
-**Status:** Phase 1 implements the service `GET /`, `GET /health`, sample collection GET endpoints, gateway proxy routing, and gateway `GET /health`. Phase 2A adds round-robin distribution; Phase 2B restricts selection to backends whose direct `/health` probe returned 2xx. Client-facing service routes are unchanged. Other operations and policies remain planned.
+**Status:** Phase 1 implements the service `GET /`, `GET /health`, sample collection GET endpoints, gateway proxy routing, and gateway `GET /health`. Phase 2A adds round-robin distribution; Phase 2B restricts selection to backends whose direct `/health` probe returned 2xx; Phase 3A adds configurable upstream request timeouts. Client-facing service routes are unchanged. Other operations and policies remain planned.
 
 ## Conventions
 
@@ -10,6 +10,9 @@
 - Optional multiple instances are configured with comma-separated full URLs in `PRODUCT_SERVICE_URLS`, `ORDER_SERVICE_URLS`, and `USER_SERVICE_URLS`. No additional port assignment is mandated.
 - The gateway probes each backend directly with `GET /health` every 5 seconds and a 2-second timeout. Redirects are not followed. Each service request goes to the next healthy configured instance.
 - If all instances for a service are unhealthy, the gateway returns `503 Service Unavailable`. If a selected backend becomes unreachable between probes, the existing proxy returns `502 Bad Gateway`. The gateway does not retry application requests.
+- `INTELLIGATE_UPSTREAM_TIMEOUT` configures the maximum upstream request duration using a positive Go duration; it defaults to `5s`. Invalid, zero, or negative values prevent startup.
+- If the upstream deadline expires before response headers arrive, the gateway returns `504 Gateway Timeout` with the plain-text message `upstream request timed out`. Ordinary connection/proxy failures remain `502 Bad Gateway`.
+- The timeout is derived from the incoming request context and cancels upstream work. If it expires after response headers have been sent, the status cannot be changed and the response may be truncated; responses are not buffered.
 - The gateway preserves the full incoming path and query when proxying. It does not strip the `/api/v1/<service>` prefix.
 - Implemented service routes return sample data and do not require authentication. Do not treat them as production APIs.
 - The user-order listing operation is owned by the Order Service, not the User Service. Although it may be expressed conceptually as `GET /api/v1/users/{user_id}/orders`, it is exposed at `GET /api/v1/orders/users/{user_id}` to follow the Order Service route namespace.
@@ -152,6 +155,6 @@ Administrative paths are provisional and must not be exposed publicly without an
 - **Expected response:** `200 OK`, for example `{"items":[{"client_id":"client-123","capacity":100,"refill_per_second":10}]}`. Actual fields and exposure are TBD.
 - **Authentication:** Planned administrator-only authentication; mechanism TBD.
 
-## Planned error cases
+## Gateway error behavior
 
-The gateway returns `404 Not Found` for an unmapped path, `503 Service Unavailable` when all configured instances for a matched service are unhealthy, and `502 Bad Gateway` when a backend selected as healthy cannot be reached. Otherwise, it forwards the backend's response. Application responses do not alter health state, and the gateway does not retry another instance. Authentication failure, rate limiting, invalid-request, and other planned error schemas are not implemented.
+The gateway returns `404 Not Found` for an unmapped path, `503 Service Unavailable` when all configured instances for a matched service are unhealthy, `502 Bad Gateway` for ordinary proxy failures, and `504 Gateway Timeout` when an upstream deadline expires before response headers arrive. Otherwise, it forwards the backend's response. Application responses do not alter health state, and the gateway does not retry another instance. Authentication failure, rate limiting, invalid-request, and other planned error schemas are not implemented.

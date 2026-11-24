@@ -1,11 +1,17 @@
 package proxy
 
 import (
+	"context"
+	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"time"
 )
+
+const DefaultUpstreamTimeout = 5 * time.Second
 
 type Backend struct {
 	Handler   http.Handler
@@ -13,7 +19,11 @@ type Backend struct {
 }
 
 func New(target string) (http.Handler, error) {
-	backend, err := NewBackend(target)
+	return NewWithTimeout(target, DefaultUpstreamTimeout)
+}
+
+func NewWithTimeout(target string, timeout time.Duration) (http.Handler, error) {
+	backend, err := NewBackendWithTimeout(target, timeout)
 	if err != nil {
 		return nil, err
 	}
@@ -21,6 +31,14 @@ func New(target string) (http.Handler, error) {
 }
 
 func NewBackend(target string) (Backend, error) {
+	return NewBackendWithTimeout(target, DefaultUpstreamTimeout)
+}
+
+func NewBackendWithTimeout(target string, timeout time.Duration) (Backend, error) {
+	if timeout <= 0 {
+		return Backend{}, errors.New("upstream timeout must be positive")
+	}
+
 	backend, err := url.Parse(target)
 	if err != nil {
 		return Backend{}, fmt.Errorf("parse backend URL %q: %w", target, err)
@@ -31,6 +49,10 @@ func NewBackend(target string) (Backend, error) {
 
 	reverseProxy := httputil.NewSingleHostReverseProxy(backend)
 	reverseProxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, err error) {
+		if isTimeoutError(err) {
+			http.Error(w, "upstream request timed out", http.StatusGatewayTimeout)
+			return
+		}
 		http.Error(w, "backend service unavailable", http.StatusBadGateway)
 	}
 
@@ -42,5 +64,20 @@ func NewBackend(target string) (Backend, error) {
 	healthURL.Fragment = ""
 	healthURL.RawFragment = ""
 
-	return Backend{Handler: reverseProxy, HealthURL: &healthURL}, nil
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(r.Context(), timeout)
+		defer cancel()
+		reverseProxy.ServeHTTP(w, r.WithContext(ctx))
+	})
+
+	return Backend{Handler: handler, HealthURL: &healthURL}, nil
+}
+
+func isTimeoutError(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+
+	var networkError net.Error
+	return errors.As(err, &networkError) && networkError.Timeout()
 }

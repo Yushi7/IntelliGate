@@ -1,6 +1,6 @@
 # Testing Strategy
 
-**Status:** Phase 1 includes Go router/proxy tests and pytest service endpoint tests. Phase 2A and 2B include Go Round Robin, active health-check, and gateway integration tests. Tests for later features remain planned.
+**Status:** Phase 1 includes Go router/proxy tests and pytest service endpoint tests. Phase 2A and 2B include Go Round Robin, active health-check, and gateway integration tests. Phase 3A adds timeout configuration and upstream proxy timeout tests. Tests for later features remain planned.
 
 ## Principles
 
@@ -12,7 +12,7 @@
 
 ## Go unit testing
 
-Use the Go standard `testing` package for gateway packages. Phase 2B tests healthy-only selection, distribution and wraparound among healthy instances, all-unhealthy 503, recovery, concurrent selection/health updates, concurrent probes, probe statuses/timeouts/connection failures, periodic recovery, cancellation, path/query preservation, and existing 404/502 behavior. Authentication, token-bucket behavior, adaptive scoring, EWMA, circuit breakers, and metrics remain planned.
+Use the Go standard `testing` package for gateway packages. Phase 2B tests healthy-only selection, distribution and wraparound among healthy instances, all-unhealthy 503, recovery, concurrent selection/health updates, concurrent probes, probe statuses/timeouts/connection failures, periodic recovery, cancellation, path/query preservation, and existing 404/502 behavior. Phase 3A tests default/custom timeout parsing, invalid/zero/negative values, timely upstream responses, timeout-to-504 mapping, and that a slow request does not block a concurrent request. Existing 404, 502, 503, and path/query tests provide regression coverage. Authentication, token-bucket behavior, adaptive scoring, EWMA, circuit breakers, and metrics remain planned.
 
 ## FastAPI testing with Pytest
 
@@ -29,7 +29,7 @@ go test -race ./...
 Set-Location ..
 ```
 
-The race-enabled run covers concurrent selection and health-state updates. On Windows, it requires a compatible 64-bit C compiler for cgo.
+The race-enabled run covers concurrent selection, health-state updates, and proxy requests. On Windows, it requires a compatible 64-bit C compiler for cgo.
 
 For each service, create its own virtual environment, install its requirements, and run pytest. From the repository root:
 
@@ -96,6 +96,7 @@ The existing service ports remain the single-instance defaults. To try two Produ
 
    ```powershell
    $env:PRODUCT_SERVICE_URLS = "http://localhost:8001,http://localhost:8011"
+   $env:INTELLIGATE_UPSTREAM_TIMEOUT = "5s"
    Set-Location gateway
    go run .\cmd\gateway
    ```
@@ -105,6 +106,55 @@ The existing service ports remain the single-instance defaults. To try two Produ
 4. Stop one Product Service instance and wait for the next probe (up to 5 seconds). Requests should be routed only to the remaining healthy instance. Restart the stopped instance and verify that it re-enters selection after its next successful probe.
 
 5. Stop both Product instances and wait for the next health checks. `GET /api/v1/products` should return 503 while `GET /health` at the gateway should continue returning 200. Restart at least one instance and verify routing resumes after a successful probe.
+
+### Manual upstream-timeout check
+
+Run this standard-library-only delayed backend in one PowerShell terminal. It answers health probes immediately and delays application responses for 10 seconds:
+
+```powershell
+@'
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import time
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/health":
+            body = b'{"status":"ok"}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        time.sleep(10)
+        body = b'{"delayed":true}'
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+ThreadingHTTPServer(("127.0.0.1", 8001), Handler).serve_forever()
+'@ | python -
+```
+
+In another terminal, route Product traffic to that backend and configure a 2-second timeout:
+
+```powershell
+Set-Location gateway
+$env:PRODUCT_SERVICE_URLS = "http://127.0.0.1:8001"
+$env:INTELLIGATE_UPSTREAM_TIMEOUT = "2s"
+go run .\cmd\gateway
+```
+
+From a third terminal, the product request should report 504, while gateway liveness remains 200:
+
+```powershell
+try { (Invoke-WebRequest -UseBasicParsing http://localhost:8080/api/v1/products).StatusCode } catch { [int]$_.Exception.Response.StatusCode }
+(Invoke-WebRequest -UseBasicParsing http://localhost:8080/health).StatusCode
+```
+
+The default is `5s` when `INTELLIGATE_UPSTREAM_TIMEOUT` is unset. The timeout cancels a proxy request; if it expires after upstream response headers have been sent, the gateway cannot replace the status and the response may be truncated.
 
 ## Integration testing
 

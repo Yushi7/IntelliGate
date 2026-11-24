@@ -1,6 +1,6 @@
 # IntelliGate Proposed Architecture
 
-**Status:** Phase 1 implements the Go HTTP reverse proxy and three FastAPI services. Phase 2A adds per-service Round Robin pools; Phase 2B adds active health probes and selects only healthy instances. Authentication, rate limiting, adaptive routing, databases, monitoring, and the other integrations described below remain proposed.
+**Status:** Phase 1 implements the Go HTTP reverse proxy and three FastAPI services. Phase 2A adds per-service Round Robin pools; Phase 2B adds active health probes and selects only healthy instances; Phase 3A adds configurable upstream request timeouts. Authentication, rate limiting, adaptive routing, databases, monitoring, and the other integrations described below remain proposed.
 
 ## 1. High-level system architecture
 
@@ -23,9 +23,9 @@ flowchart LR
     Prometheus -. planned signals .-> Anomaly[Python + scikit-learn anomaly analysis]
 ```
 
-**Status note:** Gateway-to-service HTTP connections, Round Robin selection, and active health checks across configured local backend pools are implemented. Redis, PostgreSQL, Prometheus, Grafana, Locust, dashboard, and anomaly-detection connections remain proposed. No containerized deployment is included.
+**Status note:** Gateway-to-service HTTP connections, Round Robin selection, active health checks, and configurable upstream request timeouts across configured local backend pools are implemented. Redis, PostgreSQL, Prometheus, Grafana, Locust, dashboard, and anomaly-detection connections remain proposed. No containerized deployment is included.
 
-### Phase 1/2B runtime configuration
+### Phase 1/3A runtime configuration
 
 | Component | Local address | Gateway route |
 | --- | --- | --- |
@@ -37,6 +37,8 @@ flowchart LR
 When the corresponding URL-list environment variable is unset, the gateway defaults to one backend per service at the listed address. Configure multiple backends using comma-separated full URLs in `PRODUCT_SERVICE_URLS`, `ORDER_SERVICE_URLS`, and `USER_SERVICE_URLS`. Additional port values are chosen by the local operator; the table shows existing defaults, not a required multi-instance port layout. The gateway keeps the incoming path and query string unchanged when proxying. Each service also exposes `GET /` and `GET /health` directly on its local port.
 
 The gateway probes each configured backend's `/health` directly with GET requests every 5 seconds and a 2-second timeout. Initial probes run concurrently and complete before the gateway begins serving. Only direct 2xx responses count as healthy; redirects are not followed. An unavailable backend can continue to receive traffic until a subsequent failed probe completes.
+
+Application proxy requests use `INTELLIGATE_UPSTREAM_TIMEOUT`, a positive Go duration parsed at startup. It defaults to `5s`; invalid, zero, or negative values stop startup with an error. The timeout bounds the upstream request using the incoming request context; health probes continue to use their separate 2-second timeout.
 
 ## 2. Component responsibilities
 
@@ -51,7 +53,7 @@ Beyond the Phase 1 behavior below, the gateway is planned to:
 - Select a configured backend instance round-robin within each service pool (implemented in Phase 2A).
 - Probe backend health and select only healthy instances (implemented in Phase 2B).
 - Select instances using an adaptive policy (planned; not implemented).
-- Reverse-proxy requests and responses with appropriate timeouts and error handling.
+- Bound upstream proxy requests using the configured timeout (implemented in Phase 3A); preserve 502 for ordinary proxy failures and return 504 when an upstream deadline expires before response headers.
 - Gather latency, request, health, and circuit-breaker metrics.
 - Expose gateway `GET /health` (implemented); readiness and Prometheus metrics endpoints remain planned.
 - Exclude unhealthy instances and restore them after a successful probe (implemented in Phase 2B).
@@ -86,7 +88,7 @@ The Phase 2B application request path is:
 1. Receive an HTTP request at port 8080.
 2. Match the request path to one of the three service prefixes; return 404 if none matches.
 3. Select the next healthy configured instance for that service under a short mutex lock; return 503 if none is healthy.
-4. Proxy the request with its original path and query; return 502 if the selected backend is unreachable.
+4. Proxy the request with its original path and query; return 502 for ordinary proxy failures or 504 if the upstream deadline expires before response headers.
 5. Log the method and path without query parameters.
 
 Separately, the health checker probes every configured instance directly at `/health`. The gateway marks all instances unhealthy before the first probe cycle, completes that cycle before accepting application traffic, then starts periodic checks. Probe status changes update the corresponding selector; later successful probes restore eligibility.
@@ -98,7 +100,13 @@ The following extended path remains proposed:
 3. Obtain healthy backends, select an instance using the configured adaptive policy, and proxy the request.
 4. Record request outcome, latency, health, and circuit-breaker signals.
 
-No application retry policy or explicit upstream timeout is configured. Additional middleware, error schemas, and timeout policy remain to be defined. Automatic retries are not assumed.
+No application retry policy is configured. The upstream request timeout is configurable as described below; additional middleware and error schemas remain to be defined. Automatic retries are not assumed.
+
+### Upstream request timeout (implemented in Phase 3A)
+
+`INTELLIGATE_UPSTREAM_TIMEOUT` accepts a positive Go duration such as `3s` or `1500ms`; if unset, the default is `5s`. Configuration is validated before backend startup. Each proxy request gets a timeout context derived from its incoming request context, so a client cancellation or earlier client deadline is preserved. The timeout cancels the upstream operation and does not hold a shared lock or block other proxy requests.
+
+If the deadline expires before upstream response headers arrive, the gateway returns `504 Gateway Timeout`. Connection and other ordinary proxy failures continue to return `502 Bad Gateway`; no retry is attempted. If the deadline expires after response headers have been sent, the status cannot be changed and the response may be truncated. This keeps the existing streaming proxy behavior without buffering whole responses.
 
 ```mermaid
 sequenceDiagram
@@ -163,7 +171,8 @@ flowchart TD
     RRChoice --> Proxy[Proxy request]
     AdaptiveChoice --> Proxy
     Proxy --> Failure{Backend unavailable?}
-    Failure -->|Yes| BadGateway[Return 502; no retry]
+    Failure -->|Timeout before headers| GatewayTimeout[Return 504; no retry]
+    Failure -->|Other proxy error| BadGateway[Return 502; no retry]
     Failure -->|No| Response[Return backend response]
 ```
 
