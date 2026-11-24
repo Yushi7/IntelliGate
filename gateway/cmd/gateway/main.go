@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"intelligate/gateway/internal/auth"
 	"intelligate/gateway/internal/balancer"
 	"intelligate/gateway/internal/circuitbreaker"
 	"intelligate/gateway/internal/health"
@@ -26,6 +27,8 @@ import (
 )
 
 const (
+	authEnabledEnv                     = "INTELLIGATE_AUTH_ENABLED"
+	apiKeysEnv                         = "INTELLIGATE_API_KEYS"
 	upstreamTimeoutEnv                 = "INTELLIGATE_UPSTREAM_TIMEOUT"
 	rateLimitEnabledEnv                = "INTELLIGATE_RATE_LIMIT_ENABLED"
 	rateLimitRateEnv                   = "INTELLIGATE_RATE_LIMIT_RATE"
@@ -43,6 +46,10 @@ func main() {
 }
 
 func runGateway() error {
+	authSettings, err := authenticationSettingsFromEnv()
+	if err != nil {
+		return err
+	}
 	upstreamTimeout, err := upstreamTimeoutFromEnv()
 	if err != nil {
 		return err
@@ -93,7 +100,7 @@ func runGateway() error {
 
 	server := &http.Server{
 		Addr:              ":8080",
-		Handler:           newHandlerWithRateLimiter(products, orders, users, rateLimiter),
+		Handler:           newHandlerWithAuthentication(products, orders, users, authSettings.Authenticator, rateLimiter),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
@@ -111,6 +118,42 @@ func runGateway() error {
 		}()
 	}
 	return serveWithHealthChecks(ctx, server, checker)
+}
+
+type authenticationSettings struct {
+	Enabled       bool
+	Authenticator *auth.Authenticator
+}
+
+func authenticationSettingsFromEnv() (authenticationSettings, error) {
+	settings := authenticationSettings{Enabled: true}
+	if value, configured := os.LookupEnv(authEnabledEnv); configured {
+		enabled, err := strconv.ParseBool(value)
+		if err != nil {
+			return authenticationSettings{}, fmt.Errorf("%s must be a boolean: %w", authEnabledEnv, err)
+		}
+		settings.Enabled = enabled
+	}
+
+	value, configured := os.LookupEnv(apiKeysEnv)
+	if !configured {
+		if settings.Enabled {
+			return authenticationSettings{}, fmt.Errorf("%s must be set when authentication is enabled", apiKeysEnv)
+		}
+		return settings, nil
+	}
+	keys, err := auth.ParseKeys(value)
+	if err != nil {
+		return authenticationSettings{}, fmt.Errorf("%s: %w", apiKeysEnv, err)
+	}
+	if !settings.Enabled {
+		return settings, nil
+	}
+	settings.Authenticator, err = auth.New(keys)
+	if err != nil {
+		return authenticationSettings{}, fmt.Errorf("%s: %w", apiKeysEnv, err)
+	}
+	return settings, nil
 }
 
 func newServiceProxy(envName, defaultURL string, upstreamTimeout time.Duration, breakerConfig circuitbreaker.Config) (*balancer.RoundRobin, []health.Backend, error) {
@@ -440,6 +483,14 @@ func newHandler(products, orders, users http.Handler) http.Handler {
 }
 
 func newHandlerWithRateLimiter(products, orders, users http.Handler, limiter *ratelimit.Limiter) http.Handler {
+	return newHandlerWithAuthentication(products, orders, users, nil, limiter)
+}
+
+func newHandlerWithAuthentication(
+	products, orders, users http.Handler,
+	authenticator *auth.Authenticator,
+	limiter *ratelimit.Limiter,
+) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -456,6 +507,9 @@ func newHandlerWithRateLimiter(products, orders, users http.Handler, limiter *ra
 	var handler http.Handler = mux
 	if limiter != nil {
 		handler = limiter.Middleware(handler)
+	}
+	if authenticator != nil {
+		handler = authenticator.Middleware(handler)
 	}
 	return requestLogger(handler)
 }

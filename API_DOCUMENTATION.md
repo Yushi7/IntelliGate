@@ -1,6 +1,6 @@
 # API Documentation
 
-**Status:** Phase 1 implements the service `GET /`, `GET /health`, sample collection GET endpoints, gateway proxy routing, and gateway `GET /health`. Phase 2A adds round-robin distribution; Phase 2B restricts selection to backends whose direct `/health` probe returned 2xx; Phase 3A adds configurable upstream request timeouts; Phase 3B adds per-backend circuit breakers; Phase 3C adds bounded retries for eligible GET/HEAD transport failures; Phase 4A adds in-memory per-client-IP token-bucket rate limiting. Client-facing service routes are unchanged. Other operations and policies remain planned.
+**Status:** Phase 1 implements the service `GET /`, `GET /health`, sample collection GET endpoints, gateway proxy routing, and gateway `GET /health`. Phase 2A adds round-robin distribution; Phase 2B restricts selection to backends whose direct `/health` probe returned 2xx; Phase 3A adds configurable upstream request timeouts; Phase 3B adds per-backend circuit breakers; Phase 3C adds bounded retries for eligible GET/HEAD transport failures; Phase 4A adds in-memory per-client-IP token-bucket rate limiting; Phase 4B.1 adds API-key authentication for gateway API routes.
 
 ## Conventions
 
@@ -9,6 +9,10 @@
 - The gateway listens on port `8080`; single-instance defaults are Product `8001`, Order `8002`, and User `8003`.
 - Optional multiple instances are configured with comma-separated full URLs in `PRODUCT_SERVICE_URLS`, `ORDER_SERVICE_URLS`, and `USER_SERVICE_URLS`. No additional port assignment is mandated.
 - The gateway probes each backend directly with `GET /health` every 5 seconds and a 2-second timeout. Redirects are not followed. Each service request goes to the next healthy configured instance.
+- API-key authentication is enabled by default. `INTELLIGATE_API_KEYS` is a comma-separated list; surrounding whitespace is trimmed, and empty or malformed entries fail startup. `INTELLIGATE_AUTH_ENABLED=false` explicitly disables authentication.
+- Every `/api/v1` and `/api/v1/*` request requires one `X-API-Key` header matching a configured key. Missing, invalid, or repeated values return `401 Unauthorized` with `{"error":"unauthorized"}`. The API key is removed before backend proxying and is not logged.
+- Gateway `GET /health` is public and bypasses authentication and rate limiting. Middleware order is request logging (method/path only), authentication, rate limiting, routing, backend selection, retries, then proxying.
+- Authentication uses configured shared secrets only. It does not provide JWTs, roles, per-key limits, distributed key storage, or automatic key rotation/revocation. Use high-entropy keys from protected secret management and TLS outside local development; never commit real keys.
 - Rate limiting is enabled by default. `INTELLIGATE_RATE_LIMIT_ENABLED` accepts `true` or `false` (unset means `true`); `INTELLIGATE_RATE_LIMIT_RATE` defaults to 10 tokens per second and `INTELLIGATE_RATE_LIMIT_BURST` defaults to 20 tokens. When enabled, rate and burst must be finite positive numbers or startup fails.
 - The token bucket is in memory, keyed by the IP parsed from `RemoteAddr`; `X-Forwarded-For` and `X-Real-IP` are not trusted. Idle buckets expire after 10 minutes and are cleaned every minute. `GET /health` is exempt. Limits are per gateway process, not global across instances.
 - A request with insufficient tokens receives `429 Too Many Requests`, `Retry-After` rounded up to a positive number of seconds, and JSON `{"error":"rate limit exceeded"}`. No global-quota headers are returned.
@@ -23,11 +27,11 @@
 - Round Robin skips OPEN breakers and backends with no available half-open trial slot. A complete upstream response, including an application 4xx/5xx, is a transport success; application response codes are not breaker failures. A successful health probe does not close an OPEN breaker.
 - If no backend is eligible because breakers are OPEN or half-open trial slots are full, the gateway returns `503 Service Unavailable` with a breaker-unavailable message. A gateway-generated upstream 502/504 counts toward that instance's breaker; a backend-originated 502/504 response does not.
 - The gateway preserves the full incoming path and query when proxying. It does not strip the `/api/v1/<service>` prefix.
-- Implemented service routes return sample data and do not require authentication. Do not treat them as production APIs.
+- Implemented service routes return sample data. Requests through the gateway require an API key; direct access to service ports bypasses gateway authentication. Do not treat these sample services as production APIs.
 - The user-order listing operation is owned by the Order Service, not the User Service. Although it may be expressed conceptually as `GET /api/v1/users/{user_id}/orders`, it is exposed at `GET /api/v1/orders/users/{user_id}` to follow the Order Service route namespace.
 - JSON examples are illustrative contract proposals, not observed responses.
-- Protected routes are planned to use `X-API-Key: <client-api-key>`. Never commit a real key.
-- Authentication policy for health, readiness, metrics, and administrative endpoints must be explicitly configured before deployment.
+- Use `X-API-Key: <client-api-key>` for gateway API requests. Never commit a real key.
+- Only gateway `GET /health` is currently public. Authentication policy for future readiness, metrics, and administrative endpoints must be explicitly configured before deployment.
 - Error response schema, pagination, and exact field validation remain to be finalized.
 
 ## Gateway operational endpoints
@@ -37,6 +41,18 @@
 - **Purpose:** Gateway liveness.
 - **Response:** `200 OK`, `{"status":"ok","service":"intelligate-gateway"}`.
 - **Routing:** Handled by the gateway and never forwarded to a service. This remains a liveness check and returns 200 independently of backend health.
+- **Authentication:** Public; no API key is required.
+
+## Gateway API key authentication (implemented in Phase 4B.1)
+
+- **Protected paths:** `/api/v1` and all `/api/v1/*` paths, including currently unmapped/future routes.
+- **Header:** `X-API-Key: <configured-key>`.
+- **Configuration:** `INTELLIGATE_API_KEYS=key-one,key-two`; values are comma-separated and surrounding whitespace is trimmed. Authentication defaults to enabled. Missing/empty/malformed key configuration prevents startup. `INTELLIGATE_AUTH_ENABLED=false` explicitly disables authentication.
+- **Failure response:** Missing, invalid, or repeated `X-API-Key` values return `401 Unauthorized`, `Content-Type: application/json`, and `{"error":"unauthorized"}`. The response does not distinguish missing from invalid credentials.
+- **Middleware order:** Request logger → authentication → rate limiter → route mux/router → health-aware selection/retries/proxy. Unauthorized requests do not consume rate-limit tokens or reach a backend.
+- **Public exception:** `GET /health` is public and also bypasses rate limiting.
+- **Credential handling:** Keys are compared using constant-time digest comparison, are not logged or returned in errors, and are stripped before forwarding to backend services. Direct requests to service ports do not pass through gateway authentication.
+- **Limitations:** Shared-secret API keys only; no JWT, roles, per-key identity/quotas, distributed storage, or automatic rotation/revocation. Use high-entropy keys, protected secret management, and TLS in deployed environments.
 
 The following additional operational endpoints remain planned.
 
@@ -70,7 +86,7 @@ Each service also implements `GET /` (service name and status) and `GET /health`
 - **Purpose:** Return the sample product catalog.
 - **Request:** No body. Query parameters are accepted by the gateway and forwarded; pagination/filtering is not implemented.
 - **Response:** `200 OK`, `{"items":[{"id":"prod-101","name":"Wireless Keyboard","price":49.99},{"id":"prod-102","name":"USB-C Hub","price":34.5}],"total":2}`.
-- **Authentication:** None in Phase 1; API-key enforcement remains planned.
+- **Authentication:** API key required when called through the gateway; direct service access is not authenticated.
 
 ### `GET /api/v1/products/{product_id}` (planned)
 
@@ -93,7 +109,7 @@ Each service also implements `GET /` (service name and status) and `GET /health`
 - **Purpose:** Return a small sample list of orders.
 - **Request:** No body.
 - **Expected response:** `200 OK`, with an `items` array and `total`.
-- **Authentication:** None in Phase 1.
+- **Authentication:** API key required when called through the gateway; direct service access is not authenticated.
 
 ### `POST /api/v1/orders` (planned)
 
@@ -123,7 +139,7 @@ Each service also implements `GET /` (service name and status) and `GET /health`
 - **Purpose:** Return a small sample list of users.
 - **Request:** No body.
 - **Expected response:** `200 OK`, with an `items` array and `total`.
-- **Authentication:** None in Phase 1.
+- **Authentication:** API key required when called through the gateway; direct service access is not authenticated.
 
 ### `POST /api/v1/users` (planned)
 
@@ -166,4 +182,4 @@ Administrative paths are provisional and must not be exposed publicly without an
 
 ## Gateway error behavior
 
-The gateway returns `404 Not Found` for an unmapped path, `429 Too Many Requests` when the per-client bucket is empty, `503 Service Unavailable` when no healthy breaker-admitted instance is available before the first attempt, `502 Bad Gateway` for exhausted ordinary proxy failures, and `504 Gateway Timeout` for upstream or retry-budget expiration before response headers arrive. After a retryable failure, if no backend can be admitted, the last gateway-observed 502/504 is returned. Otherwise, the gateway forwards the backend's response. Application responses do not alter health or count as breaker failures and are never retried. Authentication and other planned error schemas are not implemented.
+The gateway returns `401 Unauthorized` with `{"error":"unauthorized"}` for missing or invalid API keys, `404 Not Found` for an authenticated unmapped path, `429 Too Many Requests` when the per-client bucket is empty, `503 Service Unavailable` when no healthy breaker-admitted instance is available before the first attempt, `502 Bad Gateway` for exhausted ordinary proxy failures, and `504 Gateway Timeout` for upstream or retry-budget expiration before response headers arrive. After a retryable failure, if no backend can be admitted, the last gateway-observed 502/504 is returned. Otherwise, the gateway forwards the backend's response. Application responses do not alter health or count as breaker failures and are never retried.

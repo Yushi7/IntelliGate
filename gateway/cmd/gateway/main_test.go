@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"intelligate/gateway/internal/auth"
 	"intelligate/gateway/internal/circuitbreaker"
 	"intelligate/gateway/internal/health"
 	"intelligate/gateway/internal/proxy"
@@ -243,6 +244,83 @@ func TestCircuitBreakerConfigFromEnvRejectsInvalidValues(t *testing.T) {
 	}
 }
 
+func TestAuthenticationSettingsFromEnvRequiresKeysByDefault(t *testing.T) {
+	unsetEnvironment(t, authEnabledEnv, apiKeysEnv)
+
+	_, err := authenticationSettingsFromEnv()
+	if err == nil {
+		t.Fatal("authenticationSettingsFromEnv() error = nil, want missing-key error")
+	}
+	if !strings.Contains(err.Error(), apiKeysEnv) {
+		t.Errorf("error %q does not identify %s", err, apiKeysEnv)
+	}
+}
+
+func TestAuthenticationSettingsFromEnvAcceptsAndTrimsMultipleKeys(t *testing.T) {
+	t.Setenv(authEnabledEnv, "true")
+	t.Setenv(apiKeysEnv, "  first-key , second-key  ")
+
+	settings, err := authenticationSettingsFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !settings.Enabled || settings.Authenticator == nil {
+		t.Fatalf("authentication settings = %+v, want enabled authenticator", settings)
+	}
+}
+
+func TestAuthenticationSettingsFromEnvCanBeExplicitlyDisabled(t *testing.T) {
+	unsetEnvironment(t, authEnabledEnv, apiKeysEnv)
+	t.Setenv(authEnabledEnv, "false")
+
+	settings, err := authenticationSettingsFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if settings.Enabled || settings.Authenticator != nil {
+		t.Fatalf("authentication settings = %+v, want disabled without authenticator", settings)
+	}
+}
+
+func TestAuthenticationSettingsFromEnvRejectsMalformedConfiguration(t *testing.T) {
+	tests := []struct {
+		name  string
+		value string
+	}{
+		{name: "empty", value: ""},
+		{name: "whitespace", value: " \t "},
+		{name: "empty entry", value: "first-key,,second-key"},
+		{name: "trailing delimiter", value: "first-key,"},
+		{name: "internal whitespace", value: "bad key"},
+		{name: "control character", value: "bad\nkey"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Setenv(authEnabledEnv, "true")
+			t.Setenv(apiKeysEnv, test.value)
+			_, err := authenticationSettingsFromEnv()
+			if err == nil {
+				t.Fatal("authenticationSettingsFromEnv() error = nil, want malformed-key error")
+			}
+			if !strings.Contains(err.Error(), apiKeysEnv) {
+				t.Errorf("error %q does not identify %s", err, apiKeysEnv)
+			}
+			if test.value != "" && strings.Contains(err.Error(), test.value) {
+				t.Errorf("error exposed configured key data: %q", err)
+			}
+		})
+	}
+}
+
+func TestAuthenticationSettingsFromEnvRejectsInvalidEnabledFlag(t *testing.T) {
+	t.Setenv(authEnabledEnv, "sometimes")
+	t.Setenv(apiKeysEnv, "placeholder-key")
+
+	if _, err := authenticationSettingsFromEnv(); err == nil || !strings.Contains(err.Error(), authEnabledEnv) {
+		t.Fatalf("authenticationSettingsFromEnv() error = %v, want invalid %s error", err, authEnabledEnv)
+	}
+}
+
 func TestRateLimitSettingsFromEnvUsesDefaultsWhenUnset(t *testing.T) {
 	unsetEnvironment(t, rateLimitEnabledEnv, rateLimitRateEnv, rateLimitBurstEnv)
 
@@ -381,6 +459,125 @@ func TestRateLimiterRejectsBeforeRoutingAndExemptsGatewayHealth(t *testing.T) {
 	}
 	if selectorCalls.Load() != 1 {
 		t.Fatalf("selector calls = %d, want only the accepted request", selectorCalls.Load())
+	}
+}
+
+func TestUnauthenticatedRequestDoesNotConsumeRateLimitTokenOrReachBackend(t *testing.T) {
+	authenticator, err := auth.New([]string{"local-test-key"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := ratelimit.DefaultConfig()
+	config.Rate = 1
+	config.Burst = 1
+	limiter, err := ratelimit.New(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var backendCalls atomic.Int32
+	backend := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		backendCalls.Add(1)
+		w.WriteHeader(http.StatusNoContent)
+	})
+	handler := newHandlerWithAuthentication(backend, backend, backend, authenticator, limiter)
+
+	perform := func(path, key string) *httptest.ResponseRecorder {
+		recorder := httptest.NewRecorder()
+		request := httptest.NewRequest(http.MethodGet, path, nil)
+		request.RemoteAddr = "192.0.2.50:4321"
+		if key != "" {
+			request.Header.Set(auth.APIKeyHeader, key)
+		}
+		handler.ServeHTTP(recorder, request)
+		return recorder
+	}
+
+	unauthorized := perform("/api/v1/future", "")
+	if unauthorized.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthorized future route status = %d, want 401", unauthorized.Code)
+	}
+	if backendCalls.Load() != 0 {
+		t.Fatal("unauthorized request reached a backend")
+	}
+
+	accepted := perform("/api/v1/products", "local-test-key")
+	if accepted.Code != http.StatusNoContent {
+		t.Fatalf("first authorized request status = %d, want 204; authentication must precede rate limiting", accepted.Code)
+	}
+	if backendCalls.Load() != 1 {
+		t.Fatalf("backend calls after authorized request = %d, want 1", backendCalls.Load())
+	}
+
+	limited := perform("/api/v1/products", "local-test-key")
+	if limited.Code != http.StatusTooManyRequests {
+		t.Fatalf("second authorized request status = %d, want 429", limited.Code)
+	}
+	if backendCalls.Load() != 1 {
+		t.Fatalf("backend calls after rate-limited request = %d, want 1", backendCalls.Load())
+	}
+
+	healthResponse := perform("/health", "")
+	if healthResponse.Code != http.StatusOK {
+		t.Fatalf("unauthenticated health status = %d, want 200", healthResponse.Code)
+	}
+}
+
+func TestGatewayStripsAPIKeyBeforeProxyingToUpstream(t *testing.T) {
+	receivedAPIKey := make(chan string, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/health" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		receivedAPIKey <- r.Header.Get(auth.APIKeyHeader)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+	t.Setenv("PRODUCT_SERVICE_URLS", upstream.URL)
+
+	selector, backends, err := newServiceProxy(
+		"PRODUCT_SERVICE_URLS",
+		"http://localhost:8001",
+		time.Second,
+		circuitbreaker.DefaultConfig(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checker, err := health.NewChecker(backends, time.Hour, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := checker.CheckNow(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	authenticator, err := auth.New([]string{"valid-upstream-test-key"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := newHandlerWithAuthentication(
+		selector,
+		http.NotFoundHandler(),
+		http.NotFoundHandler(),
+		authenticator,
+		nil,
+	)
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/products", nil)
+	request.Header.Set(auth.APIKeyHeader, "valid-upstream-test-key")
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusNoContent {
+		t.Fatalf("gateway status = %d, want 204", recorder.Code)
+	}
+	select {
+	case got := <-receivedAPIKey:
+		if got != "" {
+			t.Errorf("upstream received X-API-Key %q, want no API key header", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("upstream did not receive the proxied request")
 	}
 }
 

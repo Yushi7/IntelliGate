@@ -1,6 +1,6 @@
 # Testing Strategy
 
-**Status:** Phase 1 includes Go router/proxy tests and pytest service endpoint tests. Phase 2A and 2B include Go Round Robin, active health-check, and gateway integration tests. Phase 3A adds timeout configuration and proxy timeout tests. Phase 3B adds circuit-breaker state, selector, proxy-outcome, and configuration tests. Phase 3C adds controlled retry, deadline, and admission tests. Phase 4A adds token-bucket, cleanup, configuration, and gateway-middleware tests.
+**Status:** Phase 1 includes Go router/proxy tests and pytest service endpoint tests. Phase 2A and 2B include Go Round Robin, active health-check, and gateway integration tests. Phase 3A adds timeout configuration and proxy timeout tests. Phase 3B adds circuit-breaker state, selector, proxy-outcome, and configuration tests. Phase 3C adds controlled retry, deadline, and admission tests. Phase 4A adds token-bucket, cleanup, configuration, and gateway-middleware tests. Phase 4B.1 adds API-key parsing, constant-time validation, configuration, middleware-order, health-exemption, and unauthorized-request tests.
 
 ## Principles
 
@@ -12,7 +12,7 @@
 
 ## Go unit testing
 
-Use the Go standard `testing` package for gateway packages. Phase 2B tests health-aware selection and probing. Phase 3A tests timeout configuration, timely/timed-out upstreams, 504 mapping, concurrent request handling, and existing error/path behavior. Phase 3B tests breaker defaults and config validation, consecutive failure threshold and reset, cooldown, HALF-OPEN admission limits, successful close, failed reopen, stale permits, cancellation, concurrent outcomes, backend isolation, Round Robin exclusion/re-entry, health-probe independence, and gateway-vs-application response classification. Phase 3C tests GET/HEAD-only retries, bounded attempts, backoff order/cancellation, replayable request bodies, alternate and single-backend selection, health/breaker admission, HALF-OPEN trials, application-status non-retry, body-stream non-retry, client-vs-gateway deadlines, retry-budget timeout, and permit completion. Phase 4A tests token consumption/refill, Retry-After rounding, per-IP separation and IPv4/IPv6 parsing, concurrent capacity, cleanup, environment validation, disabled behavior, health exemption, spoofed forwarding headers, and rejection before routing. Existing 404, 429, 502, 503, 504, and path/query tests provide regression coverage. Authentication, distributed shared quotas, adaptive scoring, EWMA, and metrics remain planned.
+Use the Go standard `testing` package for gateway packages. Phase 2B tests health-aware selection and probing. Phase 3A tests timeout configuration, timely/timed-out upstreams, 504 mapping, concurrent request handling, and existing error/path behavior. Phase 3B tests breaker defaults and config validation, consecutive failure threshold and reset, cooldown, HALF-OPEN admission limits, successful close, failed reopen, stale permits, cancellation, concurrent outcomes, backend isolation, Round Robin exclusion/re-entry, health-probe independence, and gateway-vs-application response classification. Phase 3C tests GET/HEAD-only retries, bounded attempts, backoff order/cancellation, replayable request bodies, alternate and single-backend selection, health/breaker admission, HALF-OPEN trials, application-status non-retry, body-stream non-retry, client-vs-gateway deadlines, retry-budget timeout, and permit completion. Phase 4A tests token consumption/refill, Retry-After rounding, per-IP separation and IPv4/IPv6 parsing, concurrent capacity, cleanup, environment validation, disabled behavior, health exemption, spoofed forwarding headers, and rejection before routing. Existing 404, 429, 502, 503, 504, and path/query tests provide regression coverage. JWT/role-based authorization, distributed shared quotas, adaptive scoring, EWMA, and metrics remain planned.
 
 ## FastAPI testing with Pytest
 
@@ -25,6 +25,7 @@ Run the gateway tests:
 ```powershell
 Set-Location gateway
 go test ./...
+go test -count=10 ./internal/auth
 go test -race ./...
 Set-Location ..
 ```
@@ -60,6 +61,8 @@ services\user-service\.venv\Scripts\python.exe -m pytest services\user-service
 2. In another terminal, start the gateway:
 
    ```powershell
+   $env:INTELLIGATE_AUTH_ENABLED = "true"
+   $env:INTELLIGATE_API_KEYS = "local-placeholder-key-one,local-placeholder-key-two"
    Set-Location gateway
    go run .\cmd\gateway
    ```
@@ -67,9 +70,11 @@ services\user-service\.venv\Scripts\python.exe -m pytest services\user-service
 3. From a fifth terminal, confirm each route returns service-specific JSON:
 
    ```powershell
-   Invoke-RestMethod http://localhost:8080/api/v1/products
-   Invoke-RestMethod http://localhost:8080/api/v1/orders
-   Invoke-RestMethod http://localhost:8080/api/v1/users
+   $headers = @{ "X-API-Key" = "local-placeholder-key-one" }
+   Invoke-RestMethod http://localhost:8080/api/v1/products -Headers $headers
+   Invoke-RestMethod http://localhost:8080/api/v1/orders -Headers $headers
+   Invoke-RestMethod http://localhost:8080/api/v1/users -Headers $headers
+   Invoke-RestMethod http://localhost:8080/health
    ```
 
 4. Confirm service root and health endpoints directly, and verify an unmapped gateway path returns 404:
@@ -97,11 +102,12 @@ The existing service ports remain the single-instance defaults. To try two Produ
    ```powershell
    $env:PRODUCT_SERVICE_URLS = "http://localhost:8001,http://localhost:8011"
    $env:INTELLIGATE_UPSTREAM_TIMEOUT = "5s"
+   $env:INTELLIGATE_API_KEYS = "local-placeholder-key-one,local-placeholder-key-two"
    Set-Location gateway
    go run .\cmd\gateway
    ```
 
-3. Send multiple requests to `http://localhost:8080/api/v1/products`. Both Uvicorn access logs should show `/health` probes and application traffic. The automated tests use distinguishable test backends to verify round-robin traffic, health exclusion and recovery, all-unhealthy 503, path/query preservation, and 502 if a backend fails between probes.
+3. Send multiple requests to `http://localhost:8080/api/v1/products` with `X-API-Key: local-placeholder-key-one`. Both Uvicorn access logs should show `/health` probes and application traffic. The automated tests use distinguishable test backends to verify round-robin traffic, health exclusion and recovery, all-unhealthy 503, path/query preservation, and 502 if a backend fails between probes.
 
 4. Stop one Product Service instance and wait for the next probe (up to 5 seconds). Requests should be routed only to the remaining healthy instance. Restart the stopped instance and verify that it re-enters selection after its next successful probe.
 
@@ -142,6 +148,7 @@ In another terminal, route Product traffic to that backend and configure a 2-sec
 
 ```powershell
 Set-Location gateway
+$env:INTELLIGATE_API_KEYS = "local-placeholder-key-one,local-placeholder-key-two"
 $env:PRODUCT_SERVICE_URLS = "http://127.0.0.1:8001"
 $env:INTELLIGATE_UPSTREAM_TIMEOUT = "2s"
 go run .\cmd\gateway
@@ -150,7 +157,7 @@ go run .\cmd\gateway
 From a third terminal, the product request should report 504, while gateway liveness remains 200:
 
 ```powershell
-try { (Invoke-WebRequest -UseBasicParsing http://localhost:8080/api/v1/products).StatusCode } catch { [int]$_.Exception.Response.StatusCode }
+try { (Invoke-WebRequest -UseBasicParsing http://localhost:8080/api/v1/products -Headers @{ "X-API-Key" = "local-placeholder-key-one" }).StatusCode } catch { [int]$_.Exception.Response.StatusCode }
 (Invoke-WebRequest -UseBasicParsing http://localhost:8080/health).StatusCode
 ```
 
@@ -164,9 +171,28 @@ Once components exist, verify gateway-to-Redis rate-limit behavior, gateway-to-P
 
 Verify service path routing, method/body/header forwarding, response propagation, timeouts, unavailable backends, malformed upstream responses, and behavior when no backend is eligible. Confirm that client credentials and sensitive headers are not accidentally forwarded to unrelated services.
 
-## Authentication testing
+## API-key authentication testing (implemented in Phase 4B.1)
 
-Test valid, missing, invalid, expired/revoked (if supported), and malformed API keys. Verify that protected endpoints reject unauthenticated requests before upstream invocation and that explicitly public operational endpoints follow their documented policy. Test that secrets are not exposed in responses, metrics, or logs.
+Automated tests cover multiple configured keys, whitespace trimming and malformed configuration, missing/invalid/repeated keys returning the same 401 JSON, required keys at startup, concurrent validation, no API key forwarding to services, and authentication before rate limiting and routing. They also verify that `GET /health` is public and unauthorized requests neither consume a token nor reach a backend. JWT, role, expiration, and revocation tests do not apply to this shared-key phase.
+
+For a local manual check, use only placeholder values (do not put real keys in documentation or source control). Configure and start the gateway:
+
+```powershell
+$env:INTELLIGATE_AUTH_ENABLED = "true"
+$env:INTELLIGATE_API_KEYS = "local-placeholder-key-one,local-placeholder-key-two"
+Set-Location gateway
+go run .\cmd\gateway
+```
+
+In another terminal, check the unauthenticated and authenticated behavior:
+
+```powershell
+try { (Invoke-WebRequest -UseBasicParsing http://localhost:8080/api/v1/products).StatusCode } catch { [int]$_.Exception.Response.StatusCode }
+(Invoke-WebRequest -UseBasicParsing http://localhost:8080/api/v1/products -Headers @{ "X-API-Key" = "local-placeholder-key-one" }).StatusCode
+(Invoke-WebRequest -UseBasicParsing http://localhost:8080/health).StatusCode
+```
+
+The expected statuses are 401, the backend response status, and 200 respectively. An API key is stripped before proxying and should not appear in backend logs or responses.
 
 ## Rate-limiting testing
 
@@ -190,11 +216,12 @@ go test -count=10 ./internal/circuitbreaker
 
 ## Rate-limit testing (implemented in Phase 4A)
 
-The token-bucket tests use an injectable clock for deterministic refill and expiration checks. Concurrent requests share a fixed clock to prove acceptance never exceeds bucket capacity; cleanup and access run concurrently under the limiter's map lock. Gateway tests verify startup configuration, disabled-mode compatibility, `GET /health` exemption, Retry-After/JSON responses, and that rejected requests do not reach the selector. Repeat these tests with:
+The token-bucket tests use an injectable clock for deterministic refill and expiration checks. Concurrent requests share a fixed clock to prove acceptance never exceeds bucket capacity; cleanup and access run concurrently under the limiter's map lock. Gateway tests verify startup configuration, disabled-mode compatibility, `GET /health` exemption, Retry-After/JSON responses, and that rejected requests do not reach the selector. Authentication tests verify unauthorized requests are rejected before consuming the bucket. Repeat these tests with:
 
 ```powershell
 go test -count=10 ./internal/ratelimit
 go test -count=10 ./cmd/gateway
+go test -count=10 ./internal/auth
 ```
 
 ## Performance testing
@@ -207,4 +234,4 @@ Inject controlled backend failure, latency, and restart/recovery events in a loc
 
 ## Current status
 
-Phase 1 service tests and Phase 2A/2B/3A/3B/3C/4A Go routing, health-check, timeout, circuit-breaker, retry, rate-limit, and simulated integration tests are implemented. Manual rate-limit verification has not been recorded. Record manual results in [DEVELOPMENT_LOG.md](./DEVELOPMENT_LOG.md) only after running them. Tests for authentication, distributed quotas, databases, adaptive routing, and monitoring are not implemented.
+Phase 1 service tests and Phase 2A/2B/3A/3B/3C/4A/4B.1 Go routing, health-check, timeout, circuit-breaker, retry, rate-limit, authentication, and simulated integration tests are implemented. Record manual verification results in [DEVELOPMENT_LOG.md](./DEVELOPMENT_LOG.md) only after running them. Tests for JWT/roles, distributed quotas, databases, adaptive routing, and monitoring are not implemented.

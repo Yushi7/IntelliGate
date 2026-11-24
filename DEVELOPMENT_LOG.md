@@ -137,7 +137,7 @@ This live demonstration is separate from the automated Go tests and is not a per
 
 ## Phase 3B per-backend circuit breakers
 
-**Status:** Implemented and verified with automated Go tests. No commit was created.
+**Status:** Implemented and verified with automated Go tests and live manual checks on 24 November 2026. No commit was created.
 
 ### Implemented
 
@@ -222,3 +222,41 @@ This live demonstration is separate from the automated Go tests and is not a per
 - Manual verification used 1 token/second and burst capacity 5: the first five rapid requests returned HTTP 200, and subsequent requests returned HTTP 429 with `Retry-After: 1` and `{"error":"rate limit exceeded"}`.
 - Confirmed `GET /health` remained accessible with HTTP 200 and normal requests succeeded again after token refill.
 - This limiter is process-local, not distributed. No race-detector run or performance benchmark is claimed.
+
+## Phase 4B.1 API key authentication
+
+**Status:** Implemented and verified with automated Go tests. No commit was created.
+
+### Implemented
+
+- Added reusable API-key parsing and authentication under `gateway/internal/auth/`. Keys are configured using comma-separated `INTELLIGATE_API_KEYS`; surrounding whitespace is trimmed and empty or malformed entries are rejected without echoing key values.
+- Authentication is enabled by default through `INTELLIGATE_AUTH_ENABLED`; when enabled, missing or empty key configuration prevents startup. Explicit `INTELLIGATE_AUTH_ENABLED=false` disables authentication.
+- Protected `/api/v1` and all `/api/v1/*` paths with the `X-API-Key` header, including future/unmapped routes. Missing, invalid, repeated, and comma-combined key values return the same `401` JSON response: `{"error":"unauthorized"}`.
+- Stored SHA-256 key digests and compared fixed-size digests with `crypto/subtle`. Validated keys are stripped before upstream proxying. Middleware order is logging → authentication → rate limiting → routing/proxy. Unauthorized requests do not consume limiter tokens or reach backends. Gateway `GET /health` remains public.
+- Updated README, architecture, API, and testing docs with configuration, middleware order, local placeholder-key instructions, and shared-key security limitations. Keys are not distributed; JWTs, roles, per-key policies, and automatic rotation/revocation are not implemented.
+
+### Automated verification
+
+- `gofmt` completed for all changed Go files.
+- `go test ./...` from `gateway`: passed for `cmd/gateway`, `internal/auth`, `internal/balancer`, `internal/circuitbreaker`, `internal/health`, `internal/proxy`, `internal/ratelimit`, and `internal/router`.
+- `go test -count=10 ./internal/auth`: passed.
+- `go test -count=10 ./cmd/gateway`: passed.
+- `git diff --check`: passed; Git reported only Windows line-ending normalization notices.
+- Unauthorized requests were verified not to consume rate-limit tokens.
+- An upstream `httptest` server verified that the API key is not forwarded.
+
+### Live manual verification — 24 November 2026
+
+- Missing API key returned HTTP 401.
+- Invalid API key returned HTTP 401.
+- The first configured API key returned HTTP 200 with Product Service data.
+- The second configured API key returned HTTP 200 with Product Service data.
+- Public gateway `GET /health` returned HTTP 200 without authentication.
+
+### Limitations
+
+- Shared API keys only; JWT and role-based authorization are not implemented.
+- Configuration changes require a gateway restart.
+- Direct microservice ports are not protected by gateway authentication.
+- TLS and protected secret management are required for exposed deployments.
+- There is no distributed authentication or key-rotation service.
