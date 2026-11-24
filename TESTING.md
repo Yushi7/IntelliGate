@@ -1,6 +1,6 @@
 # Testing Strategy
 
-**Status:** Phase 1 includes Go router/proxy tests and pytest health/sample-endpoint tests for each FastAPI service. Phase 2A adds Go Round Robin selector and multi-instance proxy tests. Tests for later features remain planned.
+**Status:** Phase 1 includes Go router/proxy tests and pytest service endpoint tests. Phase 2A and 2B include Go Round Robin, active health-check, and gateway integration tests. Tests for later features remain planned.
 
 ## Principles
 
@@ -12,13 +12,13 @@
 
 ## Go unit testing
 
-Use the Go standard `testing` package for gateway packages. Phase 2A tests sequential selection, wraparound, distribution, concurrent requests, multiple instances of one service, path/query preservation, and an unavailable selected backend. Authentication decisions, token-bucket behavior, adaptive scoring, EWMA updates, health transitions, circuit-breaker transitions, and metrics instrumentation remain planned.
+Use the Go standard `testing` package for gateway packages. Phase 2B tests healthy-only selection, distribution and wraparound among healthy instances, all-unhealthy 503, recovery, concurrent selection/health updates, concurrent probes, probe statuses/timeouts/connection failures, periodic recovery, cancellation, path/query preservation, and existing 404/502 behavior. Authentication, token-bucket behavior, adaptive scoring, EWMA, circuit breakers, and metrics remain planned.
 
 ## FastAPI testing with Pytest
 
 Use Pytest with FastAPI's test client for each service. Cover endpoint contracts, validation, expected status codes, domain behavior, and persistence interactions. Use isolated test data and a dedicated test database or suitable test doubles; do not point automated tests at production data.
 
-## Phase 1 test commands
+## Gateway test commands
 
 Run the gateway tests:
 
@@ -29,7 +29,7 @@ go test -race ./...
 Set-Location ..
 ```
 
-The race-enabled run covers concurrent calls to the shared Round Robin selector. On Windows, it requires a compatible 64-bit C compiler for cgo.
+The race-enabled run covers concurrent selection and health-state updates. On Windows, it requires a compatible 64-bit C compiler for cgo.
 
 For each service, create its own virtual environment, install its requirements, and run pytest. From the repository root:
 
@@ -80,9 +80,9 @@ services\user-service\.venv\Scripts\python.exe -m pytest services\user-service
    try { Invoke-WebRequest http://localhost:8080/not-a-service } catch { [int]$_.Exception.Response.StatusCode }
    ```
 
-5. Stop one service with `Ctrl+C`, request its gateway route, and verify the response status is 502. Restart the service afterward. The Go proxy test separately verifies preservation of the original path and query string.
+5. Stop one service with `Ctrl+C`. Until its next health probe completes, a request may still select it and receive 502. After the failed probe, requests should use only healthy instances. Restart the service and verify it becomes eligible after a successful probe. If all instances for a service are stopped, the route returns 503 after they are marked unhealthy. The gateway's own `/health` remains 200. Automated proxy tests verify path and query preservation.
 
-### Round Robin across multiple local instances
+### Health-aware Round Robin across multiple local instances
 
 The existing service ports remain the single-instance defaults. To try two Product instances, use any free secondary port (for example `8011`; this is an example, not a required assignment):
 
@@ -100,7 +100,11 @@ The existing service ports remain the single-instance defaults. To try two Produ
    go run .\cmd\gateway
    ```
 
-3. Send multiple requests to `http://localhost:8080/api/v1/products`. Both Uvicorn access logs should show requests. The automated proxy-pool test uses distinguishable test backends to assert exact alternation, path/query preservation, and 502 behavior when a selected instance is unavailable.
+3. Send multiple requests to `http://localhost:8080/api/v1/products`. Both Uvicorn access logs should show `/health` probes and application traffic. The automated tests use distinguishable test backends to verify round-robin traffic, health exclusion and recovery, all-unhealthy 503, path/query preservation, and 502 if a backend fails between probes.
+
+4. Stop one Product Service instance and wait for the next probe (up to 5 seconds). Requests should be routed only to the remaining healthy instance. Restart the stopped instance and verify that it re-enters selection after its next successful probe.
+
+5. Stop both Product instances and wait for the next health checks. `GET /api/v1/products` should return 503 while `GET /health` at the gateway should continue returning 200. Restart at least one instance and verify routing resumes after a successful probe.
 
 ## Integration testing
 
@@ -120,7 +124,7 @@ Test token consumption, refill timing, bucket capacity, isolation between client
 
 ## Load-balancing testing
 
-For Phase 2A Round Robin, validate sequential selection, wraparound, even distribution across configured instances, concurrency safety, and 502 behavior for an unavailable selected instance. The selector does not perform health checks or exclude unhealthy instances. For future Adaptive Least-Loaded routing, validate scoring with controlled load/latency inputs, deterministic ties, and changes as signals update. Compare policies under the same backend pool and workload.
+For Phase 2A/2B Round Robin, validate sequential selection, wraparound, even distribution among healthy configured instances, concurrency safety, exclusion of failed probes, recovery re-entry, all-unhealthy 503, and 502 for a backend that fails between probes. Probe failures—not application response codes—change health. For future Adaptive Least-Loaded routing, validate scoring with controlled load/latency inputs, deterministic ties, and changes as signals update.
 
 ## Circuit breaker testing
 
@@ -136,4 +140,4 @@ Inject controlled backend failure, latency, and restart/recovery events in a loc
 
 ## Current status
 
-Phase 1 unit and service endpoint tests and Phase 2A Go Round Robin tests are implemented. The manual integration procedure above exercises live local routing; record its result in [DEVELOPMENT_LOG.md](./DEVELOPMENT_LOG.md) only after running it. Tests for authentication, rate limiting, databases, adaptive routing, monitoring, and resilience are not implemented.
+Phase 1 service tests and Phase 2A/2B Go routing, health-check, and simulated integration tests are implemented. The manual integration procedure above exercises live local routing; record its result in [DEVELOPMENT_LOG.md](./DEVELOPMENT_LOG.md) only after running it. Tests for authentication, rate limiting, databases, adaptive routing, monitoring, and circuit breakers are not implemented.

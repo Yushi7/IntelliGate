@@ -89,6 +89,106 @@ func TestRoundRobinDistributesRequestsAcrossBackends(t *testing.T) {
 	}
 }
 
+func TestRoundRobinSelectsOnlyHealthyBackends(t *testing.T) {
+	selector, err := NewRoundRobin(
+		identifiedBackend("first"),
+		identifiedBackend("second"),
+		identifiedBackend("third"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := selector.SetHealthy(1, false); err != nil {
+		t.Fatal(err)
+	}
+
+	want := []string{"first", "third", "first", "third"}
+	for i, expected := range want {
+		if got := selectBackend(t, selector); got != expected {
+			t.Errorf("request %d selected %q, want %q", i+1, got, expected)
+		}
+	}
+}
+
+func TestRoundRobinReturnsUnavailableWhenAllBackendsAreUnhealthy(t *testing.T) {
+	selector, err := NewRoundRobin(identifiedBackend("first"), identifiedBackend("second"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range 2 {
+		if err := selector.SetHealthy(i, false); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	recorder := httptest.NewRecorder()
+	selector.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/", nil))
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusServiceUnavailable)
+	}
+}
+
+func TestRecoveredBackendReentersRoundRobinSelection(t *testing.T) {
+	selector, err := NewRoundRobin(identifiedBackend("first"), identifiedBackend("second"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := selector.SetHealthy(1, false); err != nil {
+		t.Fatal(err)
+	}
+
+	for range 2 {
+		if got := selectBackend(t, selector); got != "first" {
+			t.Fatalf("selected %q while second backend was unhealthy, want first", got)
+		}
+	}
+	if err := selector.SetHealthy(1, true); err != nil {
+		t.Fatal(err)
+	}
+	if got := selectBackend(t, selector); got != "second" {
+		t.Fatalf("recovered backend selected %q, want second", got)
+	}
+}
+
+func TestRoundRobinSelectionIsSafeDuringHealthUpdates(t *testing.T) {
+	selector, err := NewRoundRobin(
+		http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) }),
+		http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) }),
+		http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) }),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var workers sync.WaitGroup
+	workers.Add(2)
+	go func() {
+		defer workers.Done()
+		for i := 0; i < 1000; i++ {
+			recorder := httptest.NewRecorder()
+			selector.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/", nil))
+			if recorder.Code != http.StatusNoContent {
+				t.Errorf("selection returned status %d, want %d", recorder.Code, http.StatusNoContent)
+				return
+			}
+		}
+	}()
+	go func() {
+		defer workers.Done()
+		for i := 0; i < 1000; i++ {
+			if err := selector.SetHealthy(1, i%2 == 0); err != nil {
+				t.Errorf("SetHealthy(1): %v", err)
+				return
+			}
+			if err := selector.SetHealthy(2, i%2 != 0); err != nil {
+				t.Errorf("SetHealthy(2): %v", err)
+				return
+			}
+		}
+	}()
+	workers.Wait()
+}
+
 func TestRoundRobinIsSafeForConcurrentRequests(t *testing.T) {
 	const (
 		backendCount = 4

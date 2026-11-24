@@ -4,7 +4,7 @@
 
 IntelliGate is an API gateway and demonstration environment for routing traffic to an e-commerce application's Product, Order, and User services. The project is being built to explore secure client access, traffic management, service resilience, and observability in a modular microservices system.
 
-> **Phase 2A status:** The Go gateway and three FastAPI demonstration services are implemented. The gateway uses configurable, per-service Round Robin reverse-proxy pools. Authentication, rate limiting, health-based backend selection, adaptive routing, persistence, monitoring, dashboard, and deployment features remain planned.
+> **Phase 2B status:** The Go gateway and three FastAPI demonstration services are implemented. The gateway uses configurable, per-service Round Robin pools with active health checks. Authentication, rate limiting, adaptive routing, persistence, monitoring, dashboard, and deployment features remain planned.
 
 ## Problem
 
@@ -24,13 +24,14 @@ Microservice applications need a consistent entry point to authenticate clients,
 | --- | --- |
 | Go gateway with static service routing and reverse proxy | Implemented in Phase 1 |
 | Per-service Round Robin across configured backend instances | Implemented in Phase 2A |
+| Active `/health` probes and health-aware Round Robin routing | Implemented in Phase 2B |
 | Gateway and service tests | Implemented in Phase 1 |
 | API key authentication | Planned |
 | Per-client token bucket rate limiting backed by Redis | Planned |
 | Round Robin baseline routing | Implemented in Phase 2A |
 | Adaptive least-loaded routing | Planned |
 | EWMA backend latency tracking | Planned |
-| Backend health monitoring and recovery | Planned |
+| Backend health monitoring and recovery | Implemented in Phase 2B |
 | Circuit breaker | Planned |
 | Prometheus metrics and Grafana dashboards | Planned |
 | Traffic anomaly detection using Python and scikit-learn | Planned |
@@ -41,7 +42,7 @@ Microservice applications need a consistent entry point to authenticate clients,
 
 ## Architecture
 
-Clients send service requests to the Go gateway on port 8080. It routes the three service prefixes to configured FastAPI backend pools, selecting instances sequentially per service while preserving the request path and query. The defaults remain ports 8001–8003. The gateway does not health-check or retry backends. Redis, PostgreSQL, Prometheus, and Grafana integrations remain planned. See [ARCHITECTURE.md](./ARCHITECTURE.md) for current and proposed behavior.
+Clients send service requests to the Go gateway on port 8080. It routes the three service prefixes to configured FastAPI backend pools and round-robins only among instances whose direct `/health` probe returned 2xx. Probes run every 5 seconds with a 2-second timeout. The defaults remain ports 8001–8003. If all instances for a service are unhealthy, the gateway returns 503; a selected backend that fails between probes returns 502. Requests are not retried. Gateway `GET /health` remains a liveness endpoint independent of backend state. Redis, PostgreSQL, Prometheus, and Grafana integrations remain planned. See [ARCHITECTURE.md](./ARCHITECTURE.md) for details.
 
 ## Technology stack
 
@@ -76,7 +77,7 @@ IntelliGate/
 │       ├── proxy/      # implemented
 │       ├── router/     # implemented
 │       ├── middleware/ # planned
-│       ├── health/     # planned
+│       ├── health/     # active backend probes
 │       ├── circuitbreaker/ # planned
 │       └── metrics/    # planned
 ├── services/
@@ -109,10 +110,11 @@ Phase 0 created the directory structure; Phase 1 adds gateway and service source
 | 0 | Initialize structure, scope, architecture, API plan, and verification strategy | Complete |
 | 1 | Implement the foundational Go gateway and service communication | Implemented; automated tests included |
 | 2A | Add Round Robin selection across configured backend instances | Implemented; tests included |
-| Later | Add authentication, rate limiting, adaptive routing, health/resilience, and metrics | Pending |
+| 2B | Add active backend health checks and health-aware Round Robin | Implemented; tests included |
+| Later | Add authentication, rate limiting, adaptive routing, circuit breaking, and metrics | Pending |
 | Later | Add dashboard, anomaly detection, load experiments, and deployment automation | Pending |
 
-Phase 1 and Phase 2A implementations were approved and are recorded below. Later-phase work remains pending.
+Phase 1, Phase 2A, and Phase 2B implementations were approved and are recorded below. Later-phase work remains pending.
 
 ## Run locally
 
@@ -157,6 +159,6 @@ There is no Docker deployment configuration. Run the gateway and services direct
 
 ## Current implementation status
 
-- **Implemented:** Phase 1 Go reverse proxy and three FastAPI services; Phase 2A per-service Round Robin across configured backends.
-- **Not implemented:** Authentication, rate limiting, health-based backend selection, adaptive routing, circuit breaking, database/cache integration, monitoring, dashboard, load tests, Docker configuration, and CI/CD workflows.
+- **Implemented:** Phase 1 Go reverse proxy and three FastAPI services; Phase 2A per-service Round Robin; Phase 2B health checks and health-aware selection.
+- **Not implemented:** Authentication, rate limiting, adaptive routing, circuit breaking, database/cache integration, monitoring, dashboard, load tests, Docker configuration, and CI/CD workflows.
 - **Verification:** Current test and manual integration procedures are recorded in [TESTING.md](./TESTING.md); actual run results are recorded in [DEVELOPMENT_LOG.md](./DEVELOPMENT_LOG.md).

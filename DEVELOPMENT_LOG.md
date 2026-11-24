@@ -40,7 +40,8 @@ Go; Python + FastAPI; React + TypeScript; Tailwind CSS; PostgreSQL; Redis; Prome
 ### Pending implementation tasks
 
 - Phase 1 gateway, service, and foundational routing implementation is complete.
-- Design and test authentication, rate limiting, adaptive balancing, health checks, circuit breaking, and recovery.
+- Phase 2A Round Robin and Phase 2B active health checks and recovery are implemented and tested.
+- Design and test authentication, rate limiting, adaptive balancing, and circuit breaking.
 - Add database/cache integrations, metrics, dashboards, CI, and container orchestration when justified by working components.
 - Add Locust scenarios and conduct experiments; populate results only from actual runs.
 - Evaluate and document anomaly-detection design using suitable data.
@@ -92,3 +93,24 @@ This live demonstration is separate from the automated Go tests and is not a per
 - Each Product Service instance received 3 requests, all with HTTP 200 responses. The observed 3:3 distribution matched Round Robin across two backends.
 - Both instances returned identical sample product data.
 - No throughput, latency, concurrency, or other performance measurements were collected. No health-aware routing, automatic failover, or adaptive routing was demonstrated.
+
+## Phase 2B health-aware backend management
+
+**Status:** Implemented; automated Go tests passed. No commit was created.
+
+### Implemented
+
+- Added per-backend health state to the existing Round Robin selectors. The gateway initializes configured instances as unhealthy, selects only healthy instances, returns `503 Service Unavailable` when a service has no healthy instances, and restores backends after a successful probe.
+- Added direct concurrent GET probes to each backend's `/health` endpoint. The initial probe cycle completes before the gateway accepts application traffic; periodic checks run every 5 seconds with a 2-second timeout. Only 2xx responses count as healthy, redirects are not followed, and probe outcomes alone determine health.
+- Preserved existing environment variables and default backend URLs, service routes, path/query forwarding, 404 behavior, and 502 behavior for an instance that becomes unreachable between checks. Gateway `GET /health` remains a liveness endpoint independent of backend health.
+- Added selector, checker, and gateway integration tests using controlled test backends. No retries, health-based application-response inference, circuit breakers, adaptive routing, or performance instrumentation was added.
+- Updated the README, architecture, API, and testing documentation. No live multi-process health-check demonstration or performance benchmark was run for Phase 2B.
+
+### Verification
+
+- `gofmt` completed for the changed Go files.
+- `go test ./...` from `gateway`: passed for gateway, balancer, health, proxy, and router packages.
+- `go test -count=25 ./internal/balancer`: passed.
+- `go test -count=25 ./internal/health`: passed.
+- `go test -race ./...` could not complete because the available Windows MinGW compiler does not support the required 64-bit mode (`cc1.exe: sorry, unimplemented: 64-bit mode not compiled in`). Race detection is unverified.
+- No throughput, latency, concurrency-performance, or other benchmark results are claimed.

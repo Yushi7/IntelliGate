@@ -1,6 +1,6 @@
 # API Documentation
 
-**Status:** Phase 1 implements the service `GET /`, `GET /health`, sample collection GET endpoints, gateway proxy routing, and gateway `GET /health`. Phase 2A adds round-robin distribution across configured backend instances without changing client-facing service routes. Other operations and policies remain planned.
+**Status:** Phase 1 implements the service `GET /`, `GET /health`, sample collection GET endpoints, gateway proxy routing, and gateway `GET /health`. Phase 2A adds round-robin distribution; Phase 2B restricts selection to backends whose direct `/health` probe returned 2xx. Client-facing service routes are unchanged. Other operations and policies remain planned.
 
 ## Conventions
 
@@ -8,7 +8,8 @@
 - Gateway route ownership is: `/api/v1/products/*` → Product Service; `/api/v1/orders/*` → Order Service; `/api/v1/users/*` → User Service.
 - The gateway listens on port `8080`; single-instance defaults are Product `8001`, Order `8002`, and User `8003`.
 - Optional multiple instances are configured with comma-separated full URLs in `PRODUCT_SERVICE_URLS`, `ORDER_SERVICE_URLS`, and `USER_SERVICE_URLS`. No additional port assignment is mandated.
-- Each request is sent to the next configured instance for its service. The gateway does not health-check or retry an unavailable instance; that request returns `502 Bad Gateway`.
+- The gateway probes each backend directly with `GET /health` every 5 seconds and a 2-second timeout. Redirects are not followed. Each service request goes to the next healthy configured instance.
+- If all instances for a service are unhealthy, the gateway returns `503 Service Unavailable`. If a selected backend becomes unreachable between probes, the existing proxy returns `502 Bad Gateway`. The gateway does not retry application requests.
 - The gateway preserves the full incoming path and query when proxying. It does not strip the `/api/v1/<service>` prefix.
 - Implemented service routes return sample data and do not require authentication. Do not treat them as production APIs.
 - The user-order listing operation is owned by the Order Service, not the User Service. Although it may be expressed conceptually as `GET /api/v1/users/{user_id}/orders`, it is exposed at `GET /api/v1/orders/users/{user_id}` to follow the Order Service route namespace.
@@ -23,7 +24,7 @@
 
 - **Purpose:** Gateway liveness.
 - **Response:** `200 OK`, `{"status":"ok","service":"intelligate-gateway"}`.
-- **Routing:** Handled by the gateway and never forwarded to a service.
+- **Routing:** Handled by the gateway and never forwarded to a service. This remains a liveness check and returns 200 independently of backend health.
 
 The following additional operational endpoints remain planned.
 
@@ -153,4 +154,4 @@ Administrative paths are provisional and must not be exposed publicly without an
 
 ## Planned error cases
 
-The gateway returns `404 Not Found` for an unmapped path and `502 Bad Gateway` when the selected configured backend is unavailable. Otherwise, it forwards the backend's response. The gateway does not retry another instance. Authentication failure, rate limiting, invalid-request, and other planned error schemas are not implemented.
+The gateway returns `404 Not Found` for an unmapped path, `503 Service Unavailable` when all configured instances for a matched service are unhealthy, and `502 Bad Gateway` when a backend selected as healthy cannot be reached. Otherwise, it forwards the backend's response. Application responses do not alter health state, and the gateway does not retry another instance. Authentication failure, rate limiting, invalid-request, and other planned error schemas are not implemented.

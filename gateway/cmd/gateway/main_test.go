@@ -1,13 +1,19 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
+
+	"intelligate/gateway/internal/health"
 )
 
 func TestHealthReturnsGatewayStatusWithoutProxying(t *testing.T) {
@@ -111,4 +117,148 @@ func TestBackendURLsFromEnvRejectsInvalidEntries(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestGatewayHealthAwareRoutingRecoveryAndLiveness(t *testing.T) {
+	firstServer, first := newProductTestBackend(t, "first")
+	defer firstServer.Close()
+	secondServer, second := newProductTestBackend(t, "second")
+	defer secondServer.Close()
+	t.Setenv("PRODUCT_SERVICE_URLS", firstServer.URL+","+secondServer.URL)
+
+	productSelector, productBackends, err := newServiceProxy("PRODUCT_SERVICE_URLS", "http://localhost:8001")
+	if err != nil {
+		t.Fatal(err)
+	}
+	checker, err := health.NewChecker(productBackends, time.Hour, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := checker.CheckNow(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	handler := newHandler(productSelector, http.NotFoundHandler(), http.NotFoundHandler())
+	for i, want := range []string{"first", "second", "first", "second", "first", "second"} {
+		recorder := performProductRequest(handler)
+		if recorder.Code != http.StatusOK || recorder.Body.String() != want {
+			t.Fatalf("request %d = status %d, body %q; want 200 and %q", i+1, recorder.Code, recorder.Body.String(), want)
+		}
+	}
+	if got := first.requests.Load(); got != 3 {
+		t.Fatalf("first instance received %d application requests, want 3", got)
+	}
+	if got := second.requests.Load(); got != 3 {
+		t.Fatalf("second instance received %d application requests, want 3", got)
+	}
+
+	first.healthStatus.Store(http.StatusInternalServerError)
+	if err := checker.CheckNow(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		recorder := performProductRequest(handler)
+		if recorder.Code != http.StatusOK || recorder.Body.String() != "second" {
+			t.Fatalf("request with first instance unhealthy = status %d, body %q; want second instance", recorder.Code, recorder.Body.String())
+		}
+	}
+
+	first.healthStatus.Store(http.StatusOK)
+	if err := checker.CheckNow(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if recorder := performProductRequest(handler); recorder.Code != http.StatusOK || recorder.Body.String() != "first" {
+		t.Fatalf("recovered instance response = status %d, body %q; want first instance", recorder.Code, recorder.Body.String())
+	}
+
+	first.healthStatus.Store(http.StatusServiceUnavailable)
+	second.healthStatus.Store(http.StatusServiceUnavailable)
+	if err := checker.CheckNow(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	unavailable := performProductRequest(handler)
+	if unavailable.Code != http.StatusServiceUnavailable {
+		t.Fatalf("all-unhealthy status = %d, want %d", unavailable.Code, http.StatusServiceUnavailable)
+	}
+
+	healthRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(healthRecorder, httptest.NewRequest(http.MethodGet, "/health", nil))
+	if healthRecorder.Code != http.StatusOK {
+		t.Fatalf("gateway health status = %d, want %d while services are unhealthy", healthRecorder.Code, http.StatusOK)
+	}
+
+	unknown := httptest.NewRecorder()
+	handler.ServeHTTP(unknown, httptest.NewRequest(http.MethodGet, "/unknown", nil))
+	if unknown.Code != http.StatusNotFound {
+		t.Fatalf("unknown route status = %d, want %d", unknown.Code, http.StatusNotFound)
+	}
+}
+
+func TestGatewayPreserves502ForBackendUnreachableAfterHealthCheck(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/health" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		_, _ = fmt.Fprint(w, "product")
+	}))
+	t.Setenv("PRODUCT_SERVICE_URLS", backend.URL)
+
+	selector, targets, err := newServiceProxy("PRODUCT_SERVICE_URLS", "http://localhost:8001")
+	if err != nil {
+		backend.Close()
+		t.Fatal(err)
+	}
+	checker, err := health.NewChecker(targets, time.Hour, time.Second)
+	if err != nil {
+		backend.Close()
+		t.Fatal(err)
+	}
+	if err := checker.CheckNow(context.Background()); err != nil {
+		backend.Close()
+		t.Fatal(err)
+	}
+	backend.Close()
+
+	handler := newHandler(selector, http.NotFoundHandler(), http.NotFoundHandler())
+	recorder := performProductRequest(handler)
+	if recorder.Code != http.StatusBadGateway {
+		t.Fatalf("unreachable backend status = %d, want %d", recorder.Code, http.StatusBadGateway)
+	}
+}
+
+type productTestBackend struct {
+	healthStatus atomic.Int32
+	requests     atomic.Int32
+}
+
+func newProductTestBackend(t *testing.T, name string) (*httptest.Server, *productTestBackend) {
+	t.Helper()
+	state := &productTestBackend{}
+	state.healthStatus.Store(http.StatusOK)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/health" {
+			if r.Method != http.MethodGet {
+				t.Errorf("health probe method = %q, want GET", r.Method)
+			}
+			w.WriteHeader(int(state.healthStatus.Load()))
+			return
+		}
+		if got, want := r.URL.RequestURI(), "/api/v1/products?source=test"; got != want {
+			t.Errorf("application request URI = %q, want %q", got, want)
+		}
+		state.requests.Add(1)
+		_, _ = fmt.Fprint(w, name)
+	}))
+	return server, state
+}
+
+func performProductRequest(handler http.Handler) *httptest.ResponseRecorder {
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(
+		http.MethodGet,
+		"/api/v1/products?source=test",
+		nil,
+	))
+	return recorder
 }

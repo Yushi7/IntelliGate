@@ -1,34 +1,60 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"intelligate/gateway/internal/balancer"
+	"intelligate/gateway/internal/health"
 	"intelligate/gateway/internal/proxy"
 	"intelligate/gateway/internal/router"
 )
 
 func main() {
-	products, err := newServiceProxy("PRODUCT_SERVICE_URLS", "http://localhost:8001")
-	if err != nil {
+	if err := runGateway(); err != nil {
 		log.Fatal(err)
 	}
-	orders, err := newServiceProxy("ORDER_SERVICE_URLS", "http://localhost:8002")
+}
+
+func runGateway() error {
+	products, productBackends, err := newServiceProxy("PRODUCT_SERVICE_URLS", "http://localhost:8001")
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
-	users, err := newServiceProxy("USER_SERVICE_URLS", "http://localhost:8003")
+	orders, orderBackends, err := newServiceProxy("ORDER_SERVICE_URLS", "http://localhost:8002")
 	if err != nil {
-		log.Fatal(err)
+		return err
+	}
+	users, userBackends, err := newServiceProxy("USER_SERVICE_URLS", "http://localhost:8003")
+	if err != nil {
+		return err
+	}
+
+	backends := append(append(productBackends, orderBackends...), userBackends...)
+	checker, err := health.NewChecker(backends, health.CheckInterval, health.CheckTimeout)
+	if err != nil {
+		return err
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if err := checker.CheckNow(ctx); err != nil {
+		return fmt.Errorf("initial backend health checks: %w", err)
+	}
+	if ctx.Err() != nil {
+		return nil
 	}
 
 	server := &http.Server{
@@ -38,29 +64,116 @@ func main() {
 	}
 
 	log.Printf("IntelliGate listening on %s", server.Addr)
-	log.Fatal(server.ListenAndServe())
+	return serveWithHealthChecks(ctx, server, checker)
 }
 
-func newServiceProxy(envName, defaultURL string) (http.Handler, error) {
+func newServiceProxy(envName, defaultURL string) (*balancer.RoundRobin, []health.Backend, error) {
 	urls, err := backendURLsFromEnv(envName, defaultURL)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	backends := make([]http.Handler, 0, len(urls))
+	proxies := make([]proxy.Backend, 0, len(urls))
 	for _, target := range urls {
-		backend, err := proxy.New(target)
+		backend, err := proxy.NewBackend(target)
 		if err != nil {
-			return nil, fmt.Errorf("%s: %w", envName, err)
+			return nil, nil, fmt.Errorf("%s: %w", envName, err)
 		}
-		backends = append(backends, backend)
+		proxies = append(proxies, backend)
+		backends = append(backends, backend.Handler)
 	}
 
 	selector, err := balancer.NewRoundRobin(backends...)
 	if err != nil {
-		return nil, fmt.Errorf("%s: %w", envName, err)
+		return nil, nil, fmt.Errorf("%s: %w", envName, err)
 	}
-	return selector, nil
+	healthBackends := make([]health.Backend, len(proxies))
+	for i, backend := range proxies {
+		if err := selector.SetHealthy(i, false); err != nil {
+			return nil, nil, fmt.Errorf("%s backend %d: %w", envName, i, err)
+		}
+		index := i
+		healthBackends[i] = health.Backend{
+			URL: backend.HealthURL,
+			SetHealthy: func(healthy bool) error {
+				return selector.SetHealthy(index, healthy)
+			},
+		}
+	}
+	return selector, healthBackends, nil
+}
+
+func serveWithHealthChecks(ctx context.Context, server *http.Server, checker *health.Checker) error {
+	checkerContext, cancelChecker := context.WithCancel(ctx)
+	checkerDone := make(chan error, 1)
+	go func() {
+		checkerDone <- checker.Run(checkerContext)
+	}()
+
+	serverDone := make(chan error, 1)
+	go func() {
+		serverDone <- server.ListenAndServe()
+	}()
+
+	shutdown := func() error {
+		shutdownContext, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		err := server.Shutdown(shutdownContext)
+		if err != nil {
+			if closeErr := server.Close(); closeErr != nil {
+				return errors.Join(err, fmt.Errorf("force close gateway: %w", closeErr))
+			}
+		}
+		return err
+	}
+
+	select {
+	case serverErr := <-serverDone:
+		cancelChecker()
+		if err := <-checkerDone; err != nil {
+			return fmt.Errorf("health checker: %w", err)
+		}
+		if serverErr != nil && !errors.Is(serverErr, http.ErrServerClosed) {
+			return serverErr
+		}
+		return nil
+	case <-ctx.Done():
+		shutdownErr := shutdown()
+		cancelChecker()
+		serverErr := <-serverDone
+		checkerErr := <-checkerDone
+		if shutdownErr != nil {
+			return fmt.Errorf("shut down gateway: %w", shutdownErr)
+		}
+		if serverErr != nil && !errors.Is(serverErr, http.ErrServerClosed) {
+			return serverErr
+		}
+		if checkerErr != nil {
+			return fmt.Errorf("health checker: %w", checkerErr)
+		}
+		return nil
+	case checkerErr := <-checkerDone:
+		cancelChecker()
+		shutdownErr := shutdown()
+		serverErr := <-serverDone
+		if ctx.Err() != nil && checkerErr == nil {
+			if shutdownErr != nil {
+				return fmt.Errorf("shut down gateway: %w", shutdownErr)
+			}
+			if serverErr != nil && !errors.Is(serverErr, http.ErrServerClosed) {
+				return serverErr
+			}
+			return nil
+		}
+		if checkerErr == nil {
+			checkerErr = errors.New("stopped unexpectedly")
+		}
+		if shutdownErr != nil {
+			return fmt.Errorf("health checker: %v; shut down gateway: %w", checkerErr, shutdownErr)
+		}
+		return fmt.Errorf("health checker: %w", checkerErr)
+	}
 }
 
 func backendURLsFromEnv(envName, defaultURL string) ([]string, error) {

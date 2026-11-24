@@ -1,10 +1,10 @@
 # IntelliGate Proposed Architecture
 
-**Status:** Phase 1 implements the Go HTTP reverse proxy and three FastAPI services. Phase 2A adds per-service Round Robin selection across configured backend instances. Authentication, rate limiting, health-based selection, adaptive routing, databases, monitoring, and the other integrations described below remain proposed.
+**Status:** Phase 1 implements the Go HTTP reverse proxy and three FastAPI services. Phase 2A adds per-service Round Robin pools; Phase 2B adds active health probes and selects only healthy instances. Authentication, rate limiting, adaptive routing, databases, monitoring, and the other integrations described below remain proposed.
 
 ## 1. High-level system architecture
 
-The Go gateway is the public entry point for client API traffic. It proxies requests to configured Python FastAPI backend instances using Go's standard HTTP reverse-proxy capabilities and selects an instance round-robin within each service pool. Future phases may add gateway policies and service-owned domain APIs. Redis is designated for distributed rate-limit state; PostgreSQL for persistent application data and selected configuration. Prometheus/Grafana, Locust, the dashboard, and anomaly-detection component remain planned.
+The Go gateway is the public entry point for client API traffic. It proxies requests to configured Python FastAPI backend instances using Go's standard HTTP reverse-proxy capabilities and selects an instance round-robin from each service's healthy pool. Direct backend `/health` probes update eligibility. Future phases may add additional gateway policies and service-owned domain APIs. Redis is designated for distributed rate-limit state; PostgreSQL for persistent application data and selected configuration. Prometheus/Grafana, Locust, the dashboard, and anomaly-detection component remain planned.
 
 ```mermaid
 flowchart LR
@@ -23,9 +23,9 @@ flowchart LR
     Prometheus -. planned signals .-> Anomaly[Python + scikit-learn anomaly analysis]
 ```
 
-**Status note:** Gateway-to-service HTTP connections and Round Robin selection across each configured local backend pool are implemented. Redis, PostgreSQL, Prometheus, Grafana, Locust, dashboard, and anomaly-detection connections remain proposed. No containerized deployment is included.
+**Status note:** Gateway-to-service HTTP connections, Round Robin selection, and active health checks across configured local backend pools are implemented. Redis, PostgreSQL, Prometheus, Grafana, Locust, dashboard, and anomaly-detection connections remain proposed. No containerized deployment is included.
 
-### Phase 1/2A runtime configuration
+### Phase 1/2B runtime configuration
 
 | Component | Local address | Gateway route |
 | --- | --- | --- |
@@ -36,6 +36,8 @@ flowchart LR
 
 When the corresponding URL-list environment variable is unset, the gateway defaults to one backend per service at the listed address. Configure multiple backends using comma-separated full URLs in `PRODUCT_SERVICE_URLS`, `ORDER_SERVICE_URLS`, and `USER_SERVICE_URLS`. Additional port values are chosen by the local operator; the table shows existing defaults, not a required multi-instance port layout. The gateway keeps the incoming path and query string unchanged when proxying. Each service also exposes `GET /` and `GET /health` directly on its local port.
 
+The gateway probes each configured backend's `/health` directly with GET requests every 5 seconds and a 2-second timeout. Initial probes run concurrently and complete before the gateway begins serving. Only direct 2xx responses count as healthy; redirects are not followed. An unavailable backend can continue to receive traffic until a subsequent failed probe completes.
+
 ## 2. Component responsibilities
 
 ### Gateway (Go)
@@ -44,16 +46,17 @@ Beyond the Phase 1 behavior below, the gateway is planned to:
 
 - Expose a public HTTP entry point and statically route the three service prefixes (implemented).
 - Log each request method and path, without query parameters (implemented).
-- Return `404 Not Found` for unmatched paths and `502 Bad Gateway` when a backend cannot be reached (implemented).
+- Return `404 Not Found` for unmatched paths, `503 Service Unavailable` when all instances are unhealthy, and `502 Bad Gateway` when a selected backend cannot be reached (implemented).
 - Authenticate protected clients and apply per-client rate limits.
 - Select a configured backend instance round-robin within each service pool (implemented in Phase 2A).
-- Select only healthy instances using an adaptive policy (planned; not implemented).
+- Probe backend health and select only healthy instances (implemented in Phase 2B).
+- Select instances using an adaptive policy (planned; not implemented).
 - Reverse-proxy requests and responses with appropriate timeouts and error handling.
 - Gather latency, request, health, and circuit-breaker metrics.
 - Expose gateway `GET /health` (implemented); readiness and Prometheus metrics endpoints remain planned.
-- Exclude unhealthy or open-circuit instances and support controlled recovery.
+- Exclude unhealthy instances and restore them after a successful probe (implemented in Phase 2B).
 
-The `proxy` and `router` packages under `gateway/internal/` are implemented. The `middleware`, `health`, `circuitbreaker`, and `metrics` directories remain planned boundaries.
+The `proxy`, `router`, `balancer`, and `health` packages under `gateway/internal/` are implemented. The `middleware`, `circuitbreaker`, and `metrics` directories remain planned boundaries.
 
 ### Backend microservices (Python + FastAPI)
 
@@ -78,13 +81,15 @@ Each service will own its domain API. Service-level validation and persistence d
 
 ## 3. Request lifecycle
 
-The Phase 2A request path is:
+The Phase 2B application request path is:
 
 1. Receive an HTTP request at port 8080.
 2. Match the request path to one of the three service prefixes; return 404 if none matches.
-3. Select the next configured instance for that service under a short mutex lock.
-4. Proxy the request with its original path and query; return 502 if the selected backend is unavailable.
+3. Select the next healthy configured instance for that service under a short mutex lock; return 503 if none is healthy.
+4. Proxy the request with its original path and query; return 502 if the selected backend is unreachable.
 5. Log the method and path without query parameters.
+
+Separately, the health checker probes every configured instance directly at `/health`. The gateway marks all instances unhealthy before the first probe cycle, completes that cycle before accepting application traffic, then starts periodic checks. Probe status changes update the corresponding selector; later successful probes restore eligibility.
 
 The following extended path remains proposed:
 
@@ -93,14 +98,14 @@ The following extended path remains proposed:
 3. Obtain healthy backends, select an instance using the configured adaptive policy, and proxy the request.
 4. Record request outcome, latency, health, and circuit-breaker signals.
 
-No retry policy or explicit upstream timeout is configured in Phase 1. Additional middleware, error schemas, and timeout policy remain to be defined. Automatic retries are not assumed.
+No application retry policy or explicit upstream timeout is configured. Additional middleware, error schemas, and timeout policy remain to be defined. Automatic retries are not assumed.
 
 ```mermaid
 sequenceDiagram
     participant C as Client
-    participant G as Go Gateway (planned)
+    participant G as Go Gateway
     participant R as Redis (planned)
-    participant LB as Backend Pool / Router (planned)
+    participant LB as Backend Pool / Router
     participant S as FastAPI Service (planned)
     participant P as Prometheus (planned)
     C->>G: Request
@@ -108,7 +113,7 @@ sequenceDiagram
     G->>G: Validate API key for protected route
     G->>R: Consume client token
     R-->>G: Allowed or rate limited
-    G->>LB: Select healthy, circuit-eligible instance
+    G->>LB: Select healthy instance (Round Robin implemented)
     LB-->>G: Selected backend
     G->>S: Proxy request
     S-->>G: Response
@@ -117,7 +122,7 @@ sequenceDiagram
     P->>G: Scrape metrics endpoint
 ```
 
-The diagram represents intended later-phase interactions except for service-route matching, HTTP proxying, and per-service Round Robin selection, which are implemented. Phase 2A does not probe backend health, skip an unavailable instance, or retry a failed request: the selected instance's proxy error returns 502, and subsequent requests continue round-robin selection.
+The diagram represents intended later-phase interactions except for service-route matching, HTTP proxying, per-service Round Robin selection, and active health checking, which are implemented. A failed health probe marks its backend unhealthy; the gateway does not retry application requests. An application proxy failure between probes returns 502 until the next health update.
 
 ## 4. API key authentication flow
 
@@ -129,9 +134,13 @@ The planned policy is a token bucket per client, with Redis holding shared state
 
 ## 6. Routing and load balancing
 
-### Round Robin baseline (implemented in Phase 2A)
+### Health-aware Round Robin (implemented in Phase 2B)
 
-Each service has its own selector over its configured backend handler list. For each request, the selector locks briefly, returns the handler at its cursor, advances the cursor modulo the configured pool size, and unlocks before proxying. Pool configuration is static for the gateway process lifetime; an empty list is rejected during startup. The selector does not perform health checks or remove unavailable instances. A transport failure to the chosen instance returns the existing 502 response; it does not retry another instance. The next request advances normally.
+Each service has its own selector over its configured backend handler list and health flags. For each request, the selector locks briefly, scans from its cursor for the next healthy instance, advances after that selection, and unlocks before proxying. Health updates use the same mutex. If no instance is healthy, it returns `503 Service Unavailable`. The selector preserves the Phase 2A all-healthy constructor default; gateway initialization explicitly sets every instance unhealthy before probing.
+
+The health checker sends direct GET requests to each backend's `/health` endpoint. It runs the initial probes concurrently before the HTTP server starts, then probes periodically every 5 seconds with a 2-second client timeout. Only 2xx responses are healthy; redirects are not followed. Connection failures, timeouts, and other status codes mark an instance unhealthy. The next successful probe restores it to the round-robin pool. Health is based only on probe outcomes, not ordinary application responses.
+
+If a backend fails after its last successful probe, requests can still be selected for it until a later probe; the existing proxy returns 502. There are no retries or automatic failover. If all instances in a service pool are unhealthy, requests to that service return 503. Gateway `GET /health` remains a process liveness check and returns 200 regardless of backend health.
 
 ### Adaptive Least-Loaded
 
@@ -140,12 +149,14 @@ The adaptive policy will select an eligible instance using a measured load signa
 ```mermaid
 flowchart TD
     Start[Incoming service request] --> Pool[Get configured instances]
-    Pool --> Policy{Selected policy}
+    Pool --> Health{Any healthy instances?}
+    Health -->|No| Fail[Return 503 Service Unavailable]
+    Health -->|Yes| Policy{Selected policy}
     Policy -->|Round Robin implemented| RR[Advance per-service cursor]
-    RR --> RRChoice[Choose next configured instance]
-    Policy -->|Adaptive Least-Loaded planned| Filter[Filter unhealthy and circuit-ineligible instances]
+    RR --> RRChoice[Choose next healthy instance]
+    Policy -->|Adaptive Least-Loaded planned| Filter[Filter unhealthy instances]
     Filter --> Empty{Any eligible instances?}
-    Empty -->|No| Fail[Return gateway unavailable response]
+    Empty -->|No| Fail
     Empty -->|Yes| Signals[Read current load and EWMA signals]
     Signals --> Score[Rank eligible instances using configured score]
     Score --> AdaptiveChoice[Choose lowest-scored instance]
@@ -156,7 +167,7 @@ flowchart TD
     Failure -->|No| Response[Return backend response]
 ```
 
-Round Robin is implemented without health filtering. The health-aware adaptive branch is a proposed later-phase design.
+The diagram shows active-health filtering with the implemented Round Robin policy and a proposed adaptive policy. Circuit-breaker eligibility and adaptive scoring are not implemented.
 
 ## 7. EWMA latency tracking
 
@@ -166,9 +177,9 @@ The gateway is planned to maintain a per-instance exponentially weighted moving 
 
 The initialization rule, alpha, treatment of timeouts/errors, observation window, and concurrency safety need to be specified and measured. EWMA is a routing signal, not a substitute for health state or a guarantee of future latency.
 
-## 8. Health monitoring and recovery
+## 8. Health monitoring and recovery (implemented in Phase 2B)
 
-The gateway is planned to maintain backend health using configurable probes and/or observed request outcomes. Unhealthy instances will be omitted from routing until recovery criteria are satisfied. Probe path, cadence, thresholds, recovery hysteresis, and behavior during partial outages are implementation decisions. Health transitions should be observable through metrics without exposing sensitive data.
+The gateway actively probes each configured backend's `/health` endpoint using GET every 5 seconds, with a 2-second timeout and no redirect following. Initial probes run concurrently before application traffic is served. A direct HTTP 2xx response marks the instance healthy; connection errors, timeouts, redirects, and non-2xx statuses mark it unhealthy. Periodic successful probes restore eligibility. Probe outcomes—not application request statuses—control health. All-unhealthy service pools return 503; a backend failure between probes retains the existing 502 behavior. No hysteresis, retries, or health metrics are implemented.
 
 ## 9. Circuit breaker
 
@@ -197,4 +208,4 @@ A Python component using scikit-learn is planned to explore anomalies in aggrega
 
 **Fixed decisions:** Go gateway; standard-library reverse-proxy capabilities; FastAPI services; per-service Round Robin across configured backend URLs; Redis-backed distributed rate-limit state; PostgreSQL for persistent records/configuration; Prometheus and Grafana; Locust; future comparison with Adaptive Least-Loaded.
 
-**Open decisions:** Additional local backend port assignments; runtime pool reload; routing score and EWMA parameters; health thresholds and probe policy; circuit-breaker scope and thresholds; Redis failure mode; auth key lifecycle and admin authorization; metrics names and cardinality; dashboard interaction; anomaly model and operation mode.
+**Open decisions:** Additional local backend port assignments; runtime pool reload; health flapping/hysteresis policy; routing score and EWMA parameters; circuit-breaker scope and thresholds; Redis failure mode; auth key lifecycle and admin authorization; metrics names and cardinality; dashboard interaction; anomaly model and operation mode.
