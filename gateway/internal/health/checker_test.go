@@ -171,6 +171,63 @@ func TestCheckerRecoversBackendAfterSuccessfulProbe(t *testing.T) {
 	}
 }
 
+func TestCheckerReportsOnlyBackendHealthTransitions(t *testing.T) {
+	status := atomic.Int32{}
+	status.Store(http.StatusServiceUnavailable)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(int(status.Load()))
+	}))
+	defer server.Close()
+
+	var events []string
+	checker := newChecker(t, []health.Backend{{
+		URL:        backendURL(t, server.URL),
+		SetHealthy: func(bool) error { return nil },
+		OnTransition: func(healthy bool, generation uint64) {
+			events = append(events, fmt.Sprintf("%d:%t", generation, healthy))
+		},
+	}}, time.Hour, time.Second)
+	for range 2 {
+		if err := checker.CheckNow(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	status.Store(http.StatusOK)
+	for range 2 {
+		if err := checker.CheckNow(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	status.Store(http.StatusServiceUnavailable)
+	if err := checker.CheckNow(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := fmt.Sprint(events), "[1:true 2:false]"; got != want {
+		t.Fatalf("health transition events = %s, want %s", got, want)
+	}
+}
+
+func TestHealthTransitionObserverPanicDoesNotChangeProbeState(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	healthy := false
+	checker := newChecker(t, []health.Backend{{
+		URL:        backendURL(t, server.URL),
+		SetHealthy: func(value bool) error { healthy = value; return nil },
+		OnTransition: func(bool, uint64) {
+			panic("observer failure")
+		},
+	}}, time.Hour, time.Second)
+	if err := checker.CheckNow(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !healthy {
+		t.Fatal("backend was not marked healthy after observer panic")
+	}
+}
+
 func TestCheckerProbesBackendsConcurrently(t *testing.T) {
 	release := make(chan struct{})
 	var releaseOnce sync.Once

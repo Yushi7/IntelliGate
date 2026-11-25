@@ -323,3 +323,34 @@ This live demonstration is separate from the automated Go tests and is not a per
 - Redis settings are `INTELLIGATE_REDIS_ADDR` (default `localhost:6379`), optional `INTELLIGATE_REDIS_PASSWORD`, `INTELLIGATE_REDIS_DB` (default `0`), and `INTELLIGATE_RATE_LIMIT_REDIS_FAILURE_MODE=closed|open` (default `closed`).
 - Instances share quotas only when they use the same Redis server/database and matching rate/burst settings and observe the same canonical client IP. Forwarded-IP headers remain untrusted by default.
 - The client targets one Redis address and does not configure TLS, Sentinel, or Cluster. Redis availability, persistence, network access control, and transport protection are operational responsibilities. Redis rate limits are per IP, not per API key; distributed authentication and automatic fallback are not implemented. Configuration changes require a gateway restart.
+
+## Phase 5B — Prometheus and Grafana observability
+
+**Status:** Implemented and verified with Go tests, static configuration validation, and whitespace checks. No commit or push was performed.
+
+### Implemented
+
+- Added a dedicated Prometheus registry and `gateway/internal/observability` instrumentation using `github.com/prometheus/client_golang` v1.21.1 and `github.com/felixge/httpsnoop` v1.0.4. The module remains compatible with Go 1.22.
+- Added the separate `INTELLIGATE_METRICS_LISTEN_ADDR` listener (default `:9091`) with `GET /metrics`, bounded HTTP timeouts, coordinated startup, bind-error reporting, and graceful shutdown alongside the API listener. It is not wrapped by API authentication, authorization, rate limiting, or API request metrics.
+- Instrumented incoming HTTP request count, final response status, duration, method/route normalization, security denials, rate-limit rejection reasons, backend health/selection, breaker states/transitions, and retry attempts/outcomes. A request is counted once even when upstream retries occur; metrics preserve streaming response-writer behavior.
+- Added bounded observer hooks across authentication, rate limiting, health checking, Round Robin selection/retries, and circuit breakers. Health and breaker state gauges initialize for configured backends; generation guards prevent delayed callbacks from reverting gauges, while health transition counters count each transition notification. Observer failures do not change gateway outcomes.
+- Added pinned Prometheus `v3.1.0` and Grafana `11.4.0` Compose services, localhost-only ports 9090/3000, named data volumes, restart policies, health checks, environment-provided Grafana credentials, a five-second scrape of `host.docker.internal:9091`, datasource/dashboard provisioning, and the IntelliGate Overview dashboard.
+- Updated README, architecture, API, testing, and this log with metric names/labels, configuration, commands, Windows-native gateway scraping, security restrictions, and known limitations.
+
+### Verification
+
+- `gofmt` completed for all changed Go files.
+- `go test ./...` from `gateway`: passed for `cmd/gateway`, `internal/auth`, `internal/balancer`, `internal/circuitbreaker`, `internal/health`, `internal/observability`, `internal/proxy`, `internal/ratelimit`, and `internal/router`.
+- `go vet ./...` from `gateway`: passed.
+- Repeated tests passed: `go test -count=10 ./internal/observability ./internal/auth ./internal/balancer ./internal/circuitbreaker ./internal/health ./cmd/gateway`.
+- Repeated Redis-aware limiter tests passed: `go test -count=3 ./internal/ratelimit`.
+- Repeated proxy tests passed: `go test -count=10 ./internal/proxy`.
+- `docker compose -f observability\docker-compose.yml config --quiet` passed with temporary validation credentials; `python -m json.tool observability\grafana\dashboards\intelligate-overview.json` passed.
+- `git diff --check` passed; Git reported only its existing LF-to-CRLF normalization warnings.
+- The Compose stack was not started, so a live Prometheus scrape and Grafana UI/dashboard rendering were not verified. The Go race detector and performance benchmarks were not run.
+
+### Metrics and limitations
+
+- Custom metrics include HTTP request totals/duration; rate-limit rejections; security denials; backend health and transitions; backend selections and selection failures; circuit-breaker state and transitions; and upstream retry attempts/outcomes.
+- Labels use only normalized methods/routes, bounded status/reason/stage/state/outcome values, service names, and stable service/index backend IDs. Raw paths, query strings, URLs, IP addresses, API keys, roles, and arbitrary errors are not labels.
+- Metrics are process-local. Scrape each gateway instance separately to observe a multi-instance deployment. The metrics listener has no authentication or TLS; restrict its network access. No alert rules, performance claims, application dashboard, or gateway/service containerization were added.

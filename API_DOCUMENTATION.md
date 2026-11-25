@@ -1,18 +1,19 @@
 # API Documentation
 
-**Status:** Phase 1 implements the service `GET /`, `GET /health`, sample collection GET endpoints, gateway proxy routing, and gateway `GET /health`. Phase 2A adds round-robin distribution; Phase 2B restricts selection to backends whose direct `/health` probe returned 2xx; Phase 3A adds configurable upstream request timeouts; Phase 3B adds per-backend circuit breakers; Phase 3C adds bounded retries for eligible GET/HEAD transport failures; Phase 4A adds in-memory per-client-IP token-bucket rate limiting; Phase 4B.1 adds API-key authentication; Phase 4B.2 adds role-based access control; Phase 5A adds optional Redis-backed shared token-bucket storage.
+**Status:** Phase 1 implements the service `GET /`, `GET /health`, sample collection GET endpoints, gateway proxy routing, and gateway `GET /health`. Phase 2A adds round-robin distribution; Phase 2B restricts selection to backends whose direct `/health` probe returned 2xx; Phase 3A adds configurable upstream request timeouts; Phase 3B adds per-backend circuit breakers; Phase 3C adds bounded retries for eligible GET/HEAD transport failures; Phase 4A adds in-memory per-client-IP token-bucket rate limiting; Phase 4B.1 adds API-key authentication; Phase 4B.2 adds role-based access control; Phase 5A adds optional Redis-backed shared token-bucket storage; Phase 5B adds Prometheus metrics on a separate listener and a provisioned Grafana dashboard.
 
 ## Conventions
 
 - Gateway service routes are shown relative to the gateway base URL.
 - Gateway route ownership is: `/api/v1/products/*` → Product Service; `/api/v1/orders/*` → Order Service; `/api/v1/users/*` → User Service.
 - The gateway listens on port `8080`; single-instance defaults are Product `8001`, Order `8002`, and User `8003`.
+- The metrics listener defaults to port `9091` and serves `/metrics`; `INTELLIGATE_METRICS_LISTEN_ADDR` configures its host:port independently of the API listener.
 - Optional multiple instances are configured with comma-separated full URLs in `PRODUCT_SERVICE_URLS`, `ORDER_SERVICE_URLS`, and `USER_SERVICE_URLS`. No additional port assignment is mandated.
 - The gateway probes each backend directly with `GET /health` every 5 seconds and a 2-second timeout. Redirects are not followed. Each service request goes to the next healthy configured instance.
 - API-key authentication is enabled by default. Configure either `INTELLIGATE_API_KEY_ROLES` as a JSON key-to-role object, or legacy comma-separated `INTELLIGATE_API_KEYS`; setting both is rejected. Legacy keys receive the `admin` role. `INTELLIGATE_AUTH_ENABLED=false` explicitly disables authentication.
 - Every `/api/v1` and `/api/v1/*` request requires one `X-API-Key` header. Missing, invalid, repeated, or invalid credentials return `401 Unauthorized` with `{"error":"unauthorized"}`. Authenticated requests without method permission return `403 Forbidden` with `{"error":"forbidden"}`.
 - Roles allow these methods: `admin` allows GET, HEAD, POST, PUT, PATCH, DELETE; `read` allows GET and HEAD; `write` allows GET, HEAD, POST, PUT, PATCH, DELETE. Unsupported methods, including OPTIONS, TRACE, and CONNECT, are denied.
-- Gateway `GET /health` is public and bypasses authentication and rate limiting. Middleware order is request logging (method/path only), authentication, authorization, rate limiting, routing, backend selection, retries, then proxying.
+- Gateway `GET /health` is public and bypasses authentication and rate limiting. Middleware order is request logging (method/path only), authentication, authorization, rate limiting, routing, backend selection, retries, then proxying. Request metrics wrap this complete API chain to capture one final status/duration per incoming request.
 - Roles are loaded from authenticated credentials into private request context; client role headers/query parameters are not trusted. API keys and role-assertion headers are stripped before backend proxying.
 - This is shared-key authorization only. It does not provide JWT, OAuth, distributed authentication, per-key quotas, or a key rotation service. Configuration changes require gateway restart, and direct service ports bypass gateway auth. Use high-entropy keys from protected secret management and TLS outside local development; never commit real keys.
 - Rate limiting is enabled by default. `INTELLIGATE_RATE_LIMIT_ENABLED` accepts `true` or `false` (unset means `true`); `INTELLIGATE_RATE_LIMIT_RATE` defaults to 10 tokens per second and `INTELLIGATE_RATE_LIMIT_BURST` defaults to 20 tokens. When enabled, rate and burst must be finite positive numbers or startup fails.
@@ -34,7 +35,7 @@
 - The user-order listing operation is owned by the Order Service, not the User Service. Although it may be expressed conceptually as `GET /api/v1/users/{user_id}/orders`, it is exposed at `GET /api/v1/orders/users/{user_id}` to follow the Order Service route namespace.
 - JSON examples are illustrative contract proposals, not observed responses.
 - Use `X-API-Key: <client-api-key>` for gateway API requests. Never commit a real key.
-- Only gateway `GET /health` is currently public. Authentication policy for future readiness, metrics, and administrative endpoints must be explicitly configured before deployment.
+- On the API listener, only gateway `GET /health` is public. The separate metrics listener is not API-authenticated; restrict its network access with firewall and network controls.
 - Error response schema, pagination, and exact field validation remain to be finalized.
 
 ## Gateway operational endpoints
@@ -69,7 +70,7 @@
 - **Multi-instance use:** Run each gateway on a distinct listener (the default is `:8080`; `INTELLIGATE_LISTEN_ADDR` can set another host/port) and configure the same Redis address, database, rate, and burst. Each gateway must see the same client IP; forwarded headers are not trusted.
 - **Limitations:** Redis mode currently uses a single Redis address and does not configure TLS, Sentinel, or Cluster. Redis availability, persistence, access control, and transport protection are operational responsibilities. It does not provide per-key quotas, distributed authentication, or silent local fallback. Protect the Redis password and network; do not commit secrets. Memory mode remains available for local use without Redis.
 
-The following additional operational endpoints remain planned.
+The following operational endpoint remains planned.
 
 ### `GET /healthz` (planned)
 
@@ -85,12 +86,47 @@ The following additional operational endpoints remain planned.
 - **Expected response:** `200 OK`, for example `{"status":"ready"}` when ready; non-2xx when not ready.
 - **Authentication:** Planned probe endpoint; final exposure policy TBD.
 
-### `GET /metrics` (planned)
+### `GET /metrics` (implemented on the separate metrics listener)
 
-- **Purpose:** Planned Prometheus scrape endpoint.
+- **Purpose:** Prometheus scrape endpoint for gateway and Go/process metrics.
+- **Address:** `http://localhost:9091/metrics` by default; configure the listener with `INTELLIGATE_METRICS_LISTEN_ADDR`. This path is not served on the API listener.
 - **Request:** No body.
-- **Expected response:** Prometheus exposition format.
-- **Authentication:** Scrape access policy TBD; should be restricted to the monitoring network in deployed environments.
+- **Response:** `200 OK` with Prometheus exposition format for `GET`; other paths/methods are not scrape endpoints.
+- **Authentication:** Not protected by API-key auth, RBAC, or rate limiting. Restrict port 9091 to the Prometheus/monitoring network; do not expose it publicly.
+- **Lifecycle:** Starts with the gateway API server and shuts down gracefully with it. Invalid bind/startup errors are reported. The metrics server uses bounded HTTP read/write/idle timeouts.
+
+### Prometheus metric families
+
+The dedicated registry exposes these IntelliGate metrics:
+
+| Metric | Type | Labels |
+| --- | --- | --- |
+| `intelligate_http_requests_total` | Counter | `method`, `route`, `status` |
+| `intelligate_http_request_duration_seconds` | Histogram | `method`, `route` |
+| `intelligate_rate_limit_rejections_total` | Counter | `reason` (`exhausted`, `store_unavailable`) |
+| `intelligate_security_denials_total` | Counter | `stage` (`authentication`, `authorization`), `status` (`401`, `403`) |
+| `intelligate_backend_health` | Gauge | `service`, `backend_id` |
+| `intelligate_backend_health_transitions_total` | Counter | `service`, `backend_id`, `state` |
+| `intelligate_backend_selections_total` | Counter | `service`, `backend_id`, `attempt` (`initial`, `retry`) |
+| `intelligate_backend_selection_failures_total` | Counter | `service`, `reason` |
+| `intelligate_circuit_breaker_state` | Gauge | `service`, `backend_id`, `state` (`closed`, `open`, `half_open`) |
+| `intelligate_circuit_breaker_transitions_total` | Counter | `service`, `backend_id`, `from`, `to` |
+| `intelligate_upstream_retry_attempts_total` | Counter | `service`, `method` |
+| `intelligate_upstream_retry_outcomes_total` | Counter | `service`, `outcome` |
+
+Routes are normalized to `products`, `orders`, `users`, `health`, or `unmatched`; methods are known HTTP methods or `OTHER`. Backend IDs are stable service/index identifiers. Raw URL/path/query, IP, API key, role, and arbitrary error values are never metric labels. One HTTP request is counted once even when upstream retries occur. A Redis/store failure in closed mode returns 503 and increments `reason="store_unavailable"`, not the 429 quota-exhaustion series. The metrics do not provide alert rules or per-client/per-key breakdowns.
+
+### Local Prometheus and Grafana stack
+
+From the repository root in PowerShell, provide Grafana credentials through environment variables and start the monitoring-only Compose stack:
+
+```powershell
+$env:GRAFANA_ADMIN_USER = "intelligate-admin"
+$env:GRAFANA_ADMIN_PASSWORD = "replace-with-a-strong-local-password"
+docker compose -f observability\docker-compose.yml up -d
+```
+
+The gateway may run natively on Windows while Prometheus runs in Docker and scrapes `host.docker.internal:9091` every five seconds. Prometheus is published on `localhost:9090`, Grafana on `localhost:3000`, and the IntelliGate Overview dashboard and Prometheus datasource are provisioned automatically. Compose credentials are not committed; the metrics listener itself has no authentication and must remain network-restricted.
 
 ## Product service endpoints
 

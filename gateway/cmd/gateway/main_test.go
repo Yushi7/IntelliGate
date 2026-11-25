@@ -4,8 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"reflect"
 	"strings"
@@ -13,9 +16,12 @@ import (
 	"testing"
 	"time"
 
+	dto "github.com/prometheus/client_model/go"
+
 	"intelligate/gateway/internal/auth"
 	"intelligate/gateway/internal/circuitbreaker"
 	"intelligate/gateway/internal/health"
+	"intelligate/gateway/internal/observability"
 	"intelligate/gateway/internal/proxy"
 	"intelligate/gateway/internal/ratelimit"
 )
@@ -454,6 +460,23 @@ func TestListenAddressFromEnvRejectsMalformedValues(t *testing.T) {
 	}
 }
 
+func TestMetricsListenAddressFromEnvDefaultsAndValidates(t *testing.T) {
+	unsetEnvironment(t, metricsListenAddrEnv)
+	if address, err := metricsListenAddressFromEnv(); err != nil || address != ":9091" {
+		t.Fatalf("metrics listen address = %q, err=%v, want :9091", address, err)
+	}
+	t.Setenv(metricsListenAddrEnv, "127.0.0.1:19091")
+	if address, err := metricsListenAddressFromEnv(); err != nil || address != "127.0.0.1:19091" {
+		t.Fatalf("configured metrics address = %q, err=%v", address, err)
+	}
+	for _, invalid := range []string{"9091", "localhost:0", "localhost:+9091"} {
+		t.Setenv(metricsListenAddrEnv, invalid)
+		if _, err := metricsListenAddressFromEnv(); err == nil {
+			t.Errorf("metricsListenAddressFromEnv(%q) error = nil, want validation error", invalid)
+		}
+	}
+}
+
 func TestRateLimitSettingsFromEnvAcceptsOverrides(t *testing.T) {
 	unsetEnvironment(t, rateLimitStoreEnv, redisAddrEnv, redisPasswordEnv, redisDBEnv, rateLimitRedisFailureModeEnv)
 	t.Setenv(rateLimitEnabledEnv, "true")
@@ -646,6 +669,243 @@ func TestNewRateLimiterInitializesRedisWithoutMemoryCleanup(t *testing.T) {
 	if limiter.NeedsCleanup() {
 		t.Fatal("Redis-backed limiter must not start the in-memory cleanup loop")
 	}
+}
+
+func TestMetricsListenerBypassesAPIAuthenticationAndRateLimiting(t *testing.T) {
+	metrics := observability.New(time.Second)
+	authenticator, err := auth.NewWithRoles(map[string]auth.Role{"local-test-key": auth.RoleRead})
+	if err != nil {
+		t.Fatal(err)
+	}
+	authenticator.SetDenialObserver(metrics.RecordSecurityDenial)
+	config := ratelimit.DefaultConfig()
+	config.Rate = 0.000001
+	config.Burst = 1
+	limiter, err := ratelimit.New(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	limiter.SetRejectionObserver(metrics.RecordRateLimitRejection)
+	backend := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})
+	apiServer := httptest.NewServer(metrics.ObserveHTTP(newHandlerWithAuthentication(backend, backend, backend, authenticator, limiter)))
+	defer apiServer.Close()
+
+	metricsServer, metricsAddress := startMetricsListener(t, metrics)
+	defer shutdownHTTPServer(t, metricsServer)
+
+	metricsResponse, err := http.Get("http://" + metricsAddress + "/metrics")
+	if err != nil {
+		t.Fatalf("GET /metrics without API credentials: %v", err)
+	}
+	metricsBody := readAndClose(t, metricsResponse)
+	if metricsResponse.StatusCode != http.StatusOK {
+		t.Fatalf("metrics response status = %d, want 200", metricsResponse.StatusCode)
+	}
+	if strings.Contains(metricsBody, "intelligate_http_requests_total") {
+		t.Fatal("scraping metrics listener should not be counted as an API HTTP request")
+	}
+
+	unauthorized, err := http.Get(apiServer.URL + "/api/v1/products")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if body := readAndClose(t, unauthorized); unauthorized.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("API request without key status = %d body=%s, want 401", unauthorized.StatusCode, body)
+	}
+	client := &http.Client{}
+	forbiddenRequest, _ := http.NewRequest(http.MethodPost, apiServer.URL+"/api/v1/products", nil)
+	forbiddenRequest.Header.Set(auth.APIKeyHeader, "local-test-key")
+	forbidden, err := client.Do(forbiddenRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if body := readAndClose(t, forbidden); forbidden.StatusCode != http.StatusForbidden {
+		t.Fatalf("forbidden API request status = %d body=%s, want 403", forbidden.StatusCode, body)
+	}
+	request, _ := http.NewRequest(http.MethodGet, apiServer.URL+"/api/v1/products", nil)
+	request.Header.Set(auth.APIKeyHeader, "local-test-key")
+	accepted, err := client.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if body := readAndClose(t, accepted); accepted.StatusCode != http.StatusNoContent {
+		t.Fatalf("authorized API request status = %d body=%s, want 204", accepted.StatusCode, body)
+	}
+	limitedRequest, _ := http.NewRequest(http.MethodGet, apiServer.URL+"/api/v1/products", nil)
+	limitedRequest.Header.Set(auth.APIKeyHeader, "local-test-key")
+	limited, err := client.Do(limitedRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if body := readAndClose(t, limited); limited.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("exhausted API request status = %d body=%s, want 429", limited.StatusCode, body)
+	}
+
+	scrapeAfterAPIRejections, err := http.Get("http://" + metricsAddress + "/metrics")
+	if err != nil {
+		t.Fatalf("metrics scrape after API denials/limiting: %v", err)
+	}
+	scrapeBody := readAndClose(t, scrapeAfterAPIRejections)
+	if scrapeAfterAPIRejections.StatusCode != http.StatusOK {
+		t.Fatalf("metrics scrape after API denials status = %d, want 200", scrapeAfterAPIRejections.StatusCode)
+	}
+	for _, metric := range []string{
+		`intelligate_security_denials_total{stage="authentication",status="401"} 1`,
+		`intelligate_security_denials_total{stage="authorization",status="403"} 1`,
+		`intelligate_rate_limit_rejections_total{reason="exhausted"} 1`,
+	} {
+		if !strings.Contains(scrapeBody, metric) {
+			t.Errorf("metrics output does not contain %q", metric)
+		}
+	}
+}
+
+func TestConfiguredBackendMetricsFollowHealthSelectionAndBreakerEvents(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"status":"ok"}`)
+	}))
+	defer backend.Close()
+	t.Setenv("PRODUCT_SERVICE_URLS", backend.URL)
+	metrics := observability.New(time.Second)
+	breakerConfig := circuitbreaker.DefaultConfig()
+	breakerConfig.FailureThreshold = 1
+	selector, backends, err := newServiceProxyWithMetrics(
+		"PRODUCT_SERVICE_URLS",
+		"products",
+		backend.URL,
+		time.Second,
+		breakerConfig,
+		metrics,
+	)
+	if err != nil {
+		backend.Close()
+		t.Fatal(err)
+	}
+	checker, err := health.NewChecker(backends, time.Hour, time.Second)
+	if err != nil {
+		backend.Close()
+		t.Fatal(err)
+	}
+	if err := checker.CheckNow(context.Background()); err != nil {
+		backend.Close()
+		t.Fatal(err)
+	}
+	assertMetricValue(t, metrics, "intelligate_backend_health",
+		map[string]string{"service": "products", "backend_id": "products-1"}, 1)
+	assertMetricValue(t, metrics, "intelligate_backend_health_transitions_total",
+		map[string]string{"service": "products", "backend_id": "products-1", "state": "healthy"}, 1)
+
+	handler := metrics.ObserveHTTP(selector)
+	getRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(getRecorder, httptest.NewRequest(http.MethodGet, "/api/v1/products", nil))
+	if getRecorder.Code != http.StatusOK {
+		backend.Close()
+		t.Fatalf("healthy backend response = %d, want 200", getRecorder.Code)
+	}
+	assertMetricValue(t, metrics, "intelligate_backend_selections_total",
+		map[string]string{"service": "products", "backend_id": "products-1", "attempt": "initial"}, 1)
+
+	backend.Close()
+	postRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(postRecorder, httptest.NewRequest(http.MethodPost, "/api/v1/products", nil))
+	if postRecorder.Code != http.StatusBadGateway {
+		t.Fatalf("unreachable backend response = %d, want 502", postRecorder.Code)
+	}
+	assertMetricValue(t, metrics, "intelligate_circuit_breaker_state",
+		map[string]string{"service": "products", "backend_id": "products-1", "state": "open"}, 1)
+	assertMetricValue(t, metrics, "intelligate_circuit_breaker_state",
+		map[string]string{"service": "products", "backend_id": "products-1", "state": "closed"}, 0)
+
+	if err := checker.CheckNow(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	assertMetricValue(t, metrics, "intelligate_backend_health",
+		map[string]string{"service": "products", "backend_id": "products-1"}, 0)
+	assertMetricValue(t, metrics, "intelligate_backend_health_transitions_total",
+		map[string]string{"service": "products", "backend_id": "products-1", "state": "unhealthy"}, 1)
+}
+
+func TestMetricsServerStartsAndShutsDownWithGatewayServers(t *testing.T) {
+	metrics := observability.New(time.Second)
+	metricsServer := newMetricsHTTPServer(freeTCPAddress(t), metrics)
+	apiServer := &http.Server{Addr: freeTCPAddress(t), Handler: http.NotFoundHandler()}
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer backend.Close()
+	backendURL, err := url.Parse(backend.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checker, err := health.NewChecker([]health.Backend{{
+		URL:        backendURL,
+		SetHealthy: func(bool) error { return nil },
+	}}, time.Hour, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	serverDone := make(chan error, 1)
+	go func() {
+		serverDone <- serveWithServers(ctx, []*http.Server{apiServer, metricsServer}, checker)
+	}()
+
+	metricsURL := "http://" + metricsServer.Addr + "/metrics"
+	waitForHTTPStatus(t, metricsURL, http.StatusOK)
+	cancel()
+	select {
+	case err := <-serverDone:
+		if err != nil {
+			t.Fatalf("serveWithServers() error on graceful shutdown = %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("gateway and metrics servers did not shut down")
+	}
+	for _, address := range []string{metricsServer.Addr, apiServer.Addr} {
+		connection, err := net.DialTimeout("tcp", address, 100*time.Millisecond)
+		if err == nil {
+			_ = connection.Close()
+			t.Errorf("server still accepts connections on %s after shutdown", address)
+		}
+	}
+}
+
+func TestMetricsListenerBindFailureReturnsStartupErrorAndClosesOtherListeners(t *testing.T) {
+	occupied, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer occupied.Close()
+	apiAddress := freeTCPAddress(t)
+	apiServer := &http.Server{Addr: apiAddress, Handler: http.NotFoundHandler()}
+	metricsServer := newMetricsHTTPServer(occupied.Addr().String(), observability.New(time.Second))
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer backend.Close()
+	backendURL, err := url.Parse(backend.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checker, err := health.NewChecker([]health.Backend{{
+		URL:        backendURL,
+		SetHealthy: func(bool) error { return nil },
+	}}, time.Hour, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := serveWithServers(context.Background(), []*http.Server{apiServer, metricsServer}, checker); err == nil ||
+		!strings.Contains(err.Error(), metricsServer.Addr) {
+		t.Fatalf("serveWithServers() error = %v, want metrics listener bind error", err)
+	}
+	listener, err := net.Listen("tcp", apiAddress)
+	if err != nil {
+		t.Fatalf("API listener was not released after metrics startup failure: %v", err)
+	}
+	_ = listener.Close()
 }
 
 func TestRateLimiterRejectsBeforeRoutingAndExemptsGatewayHealth(t *testing.T) {
@@ -866,6 +1126,7 @@ func TestGatewayStripsAPIKeyBeforeProxyingToUpstream(t *testing.T) {
 			w.WriteHeader(http.StatusOK)
 			return
 		}
+
 		receivedAPIKey <- r.Header.Get(auth.APIKeyHeader)
 		w.WriteHeader(http.StatusNoContent)
 	}))
@@ -1091,4 +1352,122 @@ func unsetEnvironment(t *testing.T, names ...string) {
 			}
 		}
 	})
+}
+
+func startMetricsListener(t *testing.T, metrics *observability.Metrics) (*http.Server, string) {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := newMetricsHTTPServer(listener.Addr().String(), metrics)
+	done := make(chan error, 1)
+	go func() {
+		done <- server.Serve(listener)
+	}()
+	t.Cleanup(func() {
+		shutdownHTTPServer(t, server)
+		if err := <-done; err != nil && err != http.ErrServerClosed {
+			t.Errorf("metrics server exited with error: %v", err)
+		}
+	})
+	return server, listener.Addr().String()
+}
+
+func shutdownHTTPServer(t *testing.T, server *http.Server) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := server.Shutdown(ctx); err != nil && err != http.ErrServerClosed {
+		t.Errorf("shut down HTTP server %s: %v", server.Addr, err)
+	}
+}
+
+func freeTCPAddress(t *testing.T) string {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	address := listener.Addr().String()
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return address
+}
+
+func readAndClose(t *testing.T, response *http.Response) string {
+	t.Helper()
+	defer response.Body.Close()
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(body)
+}
+
+func assertMetricValue(t *testing.T, metrics *observability.Metrics, familyName string, labels map[string]string, want float64) {
+	t.Helper()
+	families, err := metrics.Registry().Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, family := range families {
+		if family.GetName() != familyName {
+			continue
+		}
+		for _, metric := range family.GetMetric() {
+			matches := true
+			for key, value := range labels {
+				found := false
+				for _, label := range metric.GetLabel() {
+					if label.GetName() == key && label.GetValue() == value {
+						found = true
+						break
+					}
+				}
+				if !found {
+					matches = false
+					break
+				}
+			}
+			if !matches {
+				continue
+			}
+			var got float64
+			switch family.GetType() {
+			case dto.MetricType_COUNTER:
+				got = metric.GetCounter().GetValue()
+			case dto.MetricType_GAUGE:
+				got = metric.GetGauge().GetValue()
+			default:
+				t.Fatalf("metric %q has unsupported type %s", familyName, family.GetType())
+			}
+			if got != want {
+				t.Fatalf("metric %s%v = %v, want %v", familyName, labels, got, want)
+			}
+			return
+		}
+	}
+	t.Fatalf("metric %s%v not found, want %v", familyName, labels, want)
+}
+
+func waitForHTTPStatus(t *testing.T, target string, want int) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		response, err := http.Get(target)
+		if err == nil {
+			readAndClose(t, response)
+			if response.StatusCode == want {
+				return
+			}
+			lastErr = fmt.Errorf("status = %d, want %d", response.StatusCode, want)
+		} else {
+			lastErr = err
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("GET %s did not return status %d: %v", target, want, lastErr)
 }

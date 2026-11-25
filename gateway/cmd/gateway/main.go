@@ -21,6 +21,7 @@ import (
 	"intelligate/gateway/internal/balancer"
 	"intelligate/gateway/internal/circuitbreaker"
 	"intelligate/gateway/internal/health"
+	"intelligate/gateway/internal/observability"
 	"intelligate/gateway/internal/proxy"
 	"intelligate/gateway/internal/ratelimit"
 	"intelligate/gateway/internal/router"
@@ -32,6 +33,7 @@ const (
 	apiKeyRolesEnv                     = "INTELLIGATE_API_KEY_ROLES"
 	upstreamTimeoutEnv                 = "INTELLIGATE_UPSTREAM_TIMEOUT"
 	listenAddrEnv                      = "INTELLIGATE_LISTEN_ADDR"
+	metricsListenAddrEnv               = "INTELLIGATE_METRICS_LISTEN_ADDR"
 	rateLimitEnabledEnv                = "INTELLIGATE_RATE_LIMIT_ENABLED"
 	rateLimitRateEnv                   = "INTELLIGATE_RATE_LIMIT_RATE"
 	rateLimitBurstEnv                  = "INTELLIGATE_RATE_LIMIT_BURST"
@@ -65,6 +67,14 @@ func runGateway() error {
 	if err != nil {
 		return err
 	}
+	metricsListenAddr, err := metricsListenAddressFromEnv()
+	if err != nil {
+		return err
+	}
+	metrics := observability.New(upstreamTimeout)
+	if authSettings.Authenticator != nil {
+		authSettings.Authenticator.SetDenialObserver(metrics.RecordSecurityDenial)
+	}
 	rateSettings, err := rateLimitSettingsFromEnv()
 	if err != nil {
 		return err
@@ -75,6 +85,7 @@ func runGateway() error {
 		return err
 	}
 	if rateLimiter != nil {
+		rateLimiter.SetRejectionObserver(metrics.RecordRateLimitRejection)
 		defer func() {
 			if err := rateLimiter.Close(); err != nil {
 				log.Printf("warning: failed to close rate-limit store: %v", err)
@@ -86,15 +97,15 @@ func runGateway() error {
 		return err
 	}
 
-	products, productBackends, err := newServiceProxy("PRODUCT_SERVICE_URLS", "http://localhost:8001", upstreamTimeout, breakerConfig)
+	products, productBackends, err := newServiceProxyWithMetrics("PRODUCT_SERVICE_URLS", "products", "http://localhost:8001", upstreamTimeout, breakerConfig, metrics)
 	if err != nil {
 		return err
 	}
-	orders, orderBackends, err := newServiceProxy("ORDER_SERVICE_URLS", "http://localhost:8002", upstreamTimeout, breakerConfig)
+	orders, orderBackends, err := newServiceProxyWithMetrics("ORDER_SERVICE_URLS", "orders", "http://localhost:8002", upstreamTimeout, breakerConfig, metrics)
 	if err != nil {
 		return err
 	}
-	users, userBackends, err := newServiceProxy("USER_SERVICE_URLS", "http://localhost:8003", upstreamTimeout, breakerConfig)
+	users, userBackends, err := newServiceProxyWithMetrics("USER_SERVICE_URLS", "users", "http://localhost:8003", upstreamTimeout, breakerConfig, metrics)
 	if err != nil {
 		return err
 	}
@@ -116,11 +127,12 @@ func runGateway() error {
 
 	server := &http.Server{
 		Addr:              listenAddr,
-		Handler:           newHandlerWithAuthentication(products, orders, users, authSettings.Authenticator, rateLimiter),
+		Handler:           metrics.ObserveHTTP(newHandlerWithAuthentication(products, orders, users, authSettings.Authenticator, rateLimiter)),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
+	metricsServer := newMetricsHTTPServer(metricsListenAddr, metrics)
 
-	log.Printf("IntelliGate listening on %s", server.Addr)
+	log.Printf("IntelliGate listening on %s (metrics on %s)", server.Addr, metricsServer.Addr)
 	if rateLimiter != nil && rateLimiter.NeedsCleanup() {
 		cleanupContext, cancelCleanup := context.WithCancel(ctx)
 		cleanupDone := make(chan struct{})
@@ -133,7 +145,7 @@ func runGateway() error {
 			<-cleanupDone
 		}()
 	}
-	return serveWithHealthChecks(ctx, server, checker)
+	return serveWithServers(ctx, []*http.Server{server, metricsServer}, checker)
 }
 
 func listenAddressFromEnv() (string, error) {
@@ -141,23 +153,55 @@ func listenAddressFromEnv() (string, error) {
 	if value, configured := os.LookupEnv(listenAddrEnv); configured {
 		address = value
 	}
+	if err := validateListenAddress(listenAddrEnv, address); err != nil {
+		return "", err
+	}
+	return address, nil
+}
+
+func metricsListenAddressFromEnv() (string, error) {
+	address := ":9091"
+	if value, configured := os.LookupEnv(metricsListenAddrEnv); configured {
+		address = value
+	}
+	if err := validateListenAddress(metricsListenAddrEnv, address); err != nil {
+		return "", err
+	}
+	return address, nil
+}
+
+func validateListenAddress(envName, address string) error {
 	if strings.TrimSpace(address) != address {
-		return "", fmt.Errorf("%s must be a host:port address", listenAddrEnv)
+		return fmt.Errorf("%s must be a host:port address", envName)
 	}
 	host, port, err := net.SplitHostPort(address)
 	if err != nil || strings.ContainsAny(host, " \t\r\n") {
-		return "", fmt.Errorf("%s must be a valid host:port address", listenAddrEnv)
+		return fmt.Errorf("%s must be a valid host:port address", envName)
 	}
 	for _, character := range port {
 		if character < '0' || character > '9' {
-			return "", fmt.Errorf("%s must include a numeric port", listenAddrEnv)
+			return fmt.Errorf("%s must include a numeric port", envName)
 		}
 	}
 	portNumber, err := strconv.Atoi(port)
 	if err != nil || portNumber < 1 || portNumber > 65535 {
-		return "", fmt.Errorf("%s must include a port between 1 and 65535", listenAddrEnv)
+		return fmt.Errorf("%s must include a port between 1 and 65535", envName)
 	}
-	return address, nil
+	return nil
+}
+
+func newMetricsHTTPServer(address string, metrics *observability.Metrics) *http.Server {
+	mux := http.NewServeMux()
+	mux.Handle("GET /metrics", metrics.Handler())
+	return &http.Server{
+		Addr:              address,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    1 << 20,
+	}
 }
 
 type authenticationSettings struct {
@@ -221,6 +265,20 @@ func authenticationSettingsFromEnv() (authenticationSettings, error) {
 }
 
 func newServiceProxy(envName, defaultURL string, upstreamTimeout time.Duration, breakerConfig circuitbreaker.Config) (*balancer.RoundRobin, []health.Backend, error) {
+	service := map[string]string{
+		"PRODUCT_SERVICE_URLS": "products",
+		"ORDER_SERVICE_URLS":   "orders",
+		"USER_SERVICE_URLS":    "users",
+	}[envName]
+	return newServiceProxyWithMetrics(envName, service, defaultURL, upstreamTimeout, breakerConfig, nil)
+}
+
+func newServiceProxyWithMetrics(
+	envName, service, defaultURL string,
+	upstreamTimeout time.Duration,
+	breakerConfig circuitbreaker.Config,
+	metrics *observability.Metrics,
+) (*balancer.RoundRobin, []health.Backend, error) {
 	urls, err := backendURLsFromEnv(envName, defaultURL)
 	if err != nil {
 		return nil, nil, err
@@ -229,7 +287,8 @@ func newServiceProxy(envName, defaultURL string, upstreamTimeout time.Duration, 
 	backends := make([]http.Handler, 0, len(urls))
 	proxies := make([]proxy.Backend, 0, len(urls))
 	breakers := make([]*circuitbreaker.Breaker, 0, len(urls))
-	for _, target := range urls {
+	backendIDs := make([]string, len(urls))
+	for index, target := range urls {
 		backend, err := proxy.NewBackendWithTimeout(target, upstreamTimeout)
 		if err != nil {
 			return nil, nil, fmt.Errorf("%s: %w", envName, err)
@@ -237,6 +296,14 @@ func newServiceProxy(envName, defaultURL string, upstreamTimeout time.Duration, 
 		breaker, err := circuitbreaker.New(breakerConfig)
 		if err != nil {
 			return nil, nil, fmt.Errorf("%s backend %d circuit breaker: %w", envName, len(proxies), err)
+		}
+		backendID := fmt.Sprintf("%s-%d", service, index+1)
+		backendIDs[index] = backendID
+		if metrics != nil {
+			metrics.InitializeBackend(service, backendID)
+			breaker.SetTransitionObserver(func(from, to circuitbreaker.State, generation uint64) {
+				metrics.RecordCircuitBreakerTransition(service, backendID, metricBreakerState(from), metricBreakerState(to), generation)
+			})
 		}
 		proxies = append(proxies, backend)
 		backends = append(backends, backend.Handler)
@@ -249,6 +316,13 @@ func newServiceProxy(envName, defaultURL string, upstreamTimeout time.Duration, 
 	)
 	if err != nil {
 		return nil, nil, fmt.Errorf("%s: %w", envName, err)
+	}
+	if metrics != nil {
+		selector.SetObserver(&serviceBalancerObserver{
+			metrics:    metrics,
+			service:    service,
+			backendIDs: backendIDs,
+		})
 	}
 	for i, breaker := range breakers {
 		if err := selector.SetCircuitBreaker(i, breaker); err != nil {
@@ -267,8 +341,45 @@ func newServiceProxy(envName, defaultURL string, upstreamTimeout time.Duration, 
 				return selector.SetHealthy(index, healthy)
 			},
 		}
+		if metrics != nil {
+			backendID := backendIDs[index]
+			healthBackends[i].OnTransition = func(healthy bool, generation uint64) {
+				metrics.SetBackendHealth(service, backendID, healthy, generation)
+			}
+		}
 	}
 	return selector, healthBackends, nil
+}
+
+type serviceBalancerObserver struct {
+	metrics    *observability.Metrics
+	service    string
+	backendIDs []string
+}
+
+func (o *serviceBalancerObserver) BackendSelected(index int, attempt string) {
+	if index >= 0 && index < len(o.backendIDs) {
+		o.metrics.RecordBackendSelection(o.service, o.backendIDs[index], attempt)
+	}
+}
+
+func (o *serviceBalancerObserver) BackendSelectionFailed(reason string) {
+	o.metrics.RecordBackendSelectionFailure(o.service, reason)
+}
+
+func (o *serviceBalancerObserver) RetryAttempt(method string) {
+	o.metrics.RecordRetryAttempt(o.service, method)
+}
+
+func (o *serviceBalancerObserver) RetryOutcome(outcome string) {
+	o.metrics.RecordRetryOutcome(o.service, outcome)
+}
+
+func metricBreakerState(state circuitbreaker.State) string {
+	if state == circuitbreaker.StateHalfOpen {
+		return "half_open"
+	}
+	return state.String()
 }
 
 func upstreamTimeoutFromEnv() (time.Duration, error) {
@@ -452,74 +563,126 @@ func positiveDurationFromEnv(envName string, defaultValue time.Duration) (time.D
 }
 
 func serveWithHealthChecks(ctx context.Context, server *http.Server, checker *health.Checker) error {
+	return serveWithServers(ctx, []*http.Server{server}, checker)
+}
+
+func serveWithServers(ctx context.Context, servers []*http.Server, checker *health.Checker) error {
+	if len(servers) == 0 {
+		return errors.New("at least one HTTP server is required")
+	}
+	listeners := make([]net.Listener, len(servers))
+	for index, server := range servers {
+		listener, err := net.Listen("tcp", server.Addr)
+		if err != nil {
+			for _, opened := range listeners {
+				if opened != nil {
+					_ = opened.Close()
+				}
+			}
+			return fmt.Errorf("listen on %s: %w", server.Addr, err)
+		}
+		listeners[index] = listener
+	}
+
 	checkerContext, cancelChecker := context.WithCancel(ctx)
 	checkerDone := make(chan error, 1)
 	go func() {
 		checkerDone <- checker.Run(checkerContext)
 	}()
 
-	serverDone := make(chan error, 1)
-	go func() {
-		serverDone <- server.ListenAndServe()
-	}()
+	type serverResult struct {
+		index int
+		err   error
+	}
+	serverDone := make(chan serverResult, len(servers))
+	for index, server := range servers {
+		index, server, listener := index, server, listeners[index]
+		go func() {
+			serverDone <- serverResult{index: index, err: server.Serve(listener)}
+		}()
+	}
 
 	shutdown := func() error {
 		shutdownContext, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		err := server.Shutdown(shutdownContext)
-		if err != nil {
-			if closeErr := server.Close(); closeErr != nil {
-				return errors.Join(err, fmt.Errorf("force close gateway: %w", closeErr))
+		var failures []error
+		for _, server := range servers {
+			if err := server.Shutdown(shutdownContext); err != nil {
+				failures = append(failures, fmt.Errorf("shut down server %s: %w", server.Addr, err))
+				if closeErr := server.Close(); closeErr != nil {
+					failures = append(failures, fmt.Errorf("force close server %s: %w", server.Addr, closeErr))
+				}
 			}
 		}
-		return err
+		return errors.Join(failures...)
 	}
 
 	select {
-	case serverErr := <-serverDone:
+	case result := <-serverDone:
+		shutdownErr := shutdown()
 		cancelChecker()
-		if err := <-checkerDone; err != nil {
-			return fmt.Errorf("health checker: %w", err)
+		checkerErr := <-checkerDone
+		var serverErrors []error
+		if result.err != nil && !errors.Is(result.err, http.ErrServerClosed) {
+			serverErrors = append(serverErrors, fmt.Errorf("HTTP server %s: %w", servers[result.index].Addr, result.err))
 		}
-		if serverErr != nil && !errors.Is(serverErr, http.ErrServerClosed) {
-			return serverErr
+		for range len(servers) - 1 {
+			other := <-serverDone
+			if other.err != nil && !errors.Is(other.err, http.ErrServerClosed) {
+				serverErrors = append(serverErrors, fmt.Errorf("HTTP server %s: %w", servers[other.index].Addr, other.err))
+			}
 		}
-		return nil
+		if checkerErr != nil && ctx.Err() == nil {
+			serverErrors = append(serverErrors, fmt.Errorf("health checker: %w", checkerErr))
+		}
+		return errors.Join(append(serverErrors, shutdownErr)...)
 	case <-ctx.Done():
 		shutdownErr := shutdown()
 		cancelChecker()
-		serverErr := <-serverDone
+		var serverErrors []error
+		for range servers {
+			result := <-serverDone
+			if result.err != nil && !errors.Is(result.err, http.ErrServerClosed) {
+				serverErrors = append(serverErrors, fmt.Errorf("HTTP server %s: %w", servers[result.index].Addr, result.err))
+			}
+		}
 		checkerErr := <-checkerDone
 		if shutdownErr != nil {
-			return fmt.Errorf("shut down gateway: %w", shutdownErr)
-		}
-		if serverErr != nil && !errors.Is(serverErr, http.ErrServerClosed) {
-			return serverErr
+			serverErrors = append(serverErrors, shutdownErr)
 		}
 		if checkerErr != nil {
-			return fmt.Errorf("health checker: %w", checkerErr)
+			serverErrors = append(serverErrors, fmt.Errorf("health checker: %w", checkerErr))
 		}
-		return nil
+		return errors.Join(serverErrors...)
 	case checkerErr := <-checkerDone:
-		cancelChecker()
-		shutdownErr := shutdown()
-		serverErr := <-serverDone
-		if ctx.Err() != nil && checkerErr == nil {
+		if ctx.Err() != nil {
+			shutdownErr := shutdown()
+			cancelChecker()
+			for range servers {
+				<-serverDone
+			}
 			if shutdownErr != nil {
 				return fmt.Errorf("shut down gateway: %w", shutdownErr)
 			}
-			if serverErr != nil && !errors.Is(serverErr, http.ErrServerClosed) {
-				return serverErr
-			}
 			return nil
+		}
+		cancelChecker()
+		shutdownErr := shutdown()
+		var serverErrors []error
+		for range servers {
+			result := <-serverDone
+			if result.err != nil && !errors.Is(result.err, http.ErrServerClosed) {
+				serverErrors = append(serverErrors, fmt.Errorf("HTTP server %s: %w", servers[result.index].Addr, result.err))
+			}
 		}
 		if checkerErr == nil {
 			checkerErr = errors.New("stopped unexpectedly")
 		}
 		if shutdownErr != nil {
-			return fmt.Errorf("health checker: %v; shut down gateway: %w", checkerErr, shutdownErr)
+			serverErrors = append(serverErrors, shutdownErr)
 		}
-		return fmt.Errorf("health checker: %w", checkerErr)
+		serverErrors = append(serverErrors, fmt.Errorf("health checker: %w", checkerErr))
+		return errors.Join(serverErrors...)
 	}
 }
 

@@ -2,6 +2,7 @@ package auth
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -112,6 +113,51 @@ func TestMiddlewareRejectsMissingInvalidAndRepeatedKeysConsistently(t *testing.T
 				t.Errorf("response exposed an API key: %q", recorder.Body.String())
 			}
 		})
+	}
+}
+
+func TestDenialObserverDistinguishesAuthenticationAndAuthorization(t *testing.T) {
+	authenticator, err := NewWithRoles(map[string]Role{"read-only-key": RoleRead})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var denials []string
+	authenticator.SetDenialObserver(func(stage string, status int) {
+		denials = append(denials, fmt.Sprintf("%s:%d", stage, status))
+	})
+	handler := authenticator.Middleware(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+
+	unauthorized := httptest.NewRecorder()
+	handler.ServeHTTP(unauthorized, httptest.NewRequest(http.MethodGet, "/api/v1/products", nil))
+	if unauthorized.Code != http.StatusUnauthorized {
+		t.Fatalf("missing key status = %d, want 401", unauthorized.Code)
+	}
+	forbidden := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/products", nil)
+	request.Header.Set(APIKeyHeader, "read-only-key")
+	handler.ServeHTTP(forbidden, request)
+	if forbidden.Code != http.StatusForbidden {
+		t.Fatalf("read-role POST status = %d, want 403", forbidden.Code)
+	}
+	if got, want := fmt.Sprint(denials), "[authentication:401 authorization:403]"; got != want {
+		t.Fatalf("denial observer events = %s, want %s", got, want)
+	}
+}
+
+func TestDenialObserverPanicDoesNotChangeAuthenticationOutcome(t *testing.T) {
+	authenticator, err := New([]string{"valid-key"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	authenticator.SetDenialObserver(func(string, int) { panic("observer failure") })
+	recorder := httptest.NewRecorder()
+	authenticator.Middleware(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Fatal("unauthorized request reached downstream")
+	})).ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/v1/products", nil))
+	if recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("status with panicking observer = %d, want 401", recorder.Code)
 	}
 }
 

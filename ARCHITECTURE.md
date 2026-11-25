@@ -1,10 +1,10 @@
 # IntelliGate Proposed Architecture
 
-**Status:** Phase 1 implements the Go HTTP reverse proxy and three FastAPI services. Phase 2A adds per-service Round Robin pools; Phase 2B adds active health probes and selects only healthy instances; Phase 3A adds configurable upstream request timeouts; Phase 3B adds per-backend circuit breakers; Phase 3C adds bounded retries for eligible upstream transport failures; Phase 4A adds an in-memory per-client-IP token bucket; Phase 4B.1 adds API-key authentication; Phase 4B.2 adds role-based access control; Phase 5A adds optional Redis-backed shared token buckets. JWT/OAuth, distributed authentication, adaptive routing, databases, monitoring, and the other integrations described below remain proposed.
+**Status:** Phase 1 implements the Go HTTP reverse proxy and three FastAPI services. Phase 2A adds per-service Round Robin pools; Phase 2B adds active health probes and selects only healthy instances; Phase 3A adds configurable upstream request timeouts; Phase 3B adds per-backend circuit breakers; Phase 3C adds bounded retries for eligible upstream transport failures; Phase 4A adds an in-memory per-client-IP token bucket; Phase 4B.1 adds API-key authentication; Phase 4B.2 adds role-based access control; Phase 5A adds optional Redis-backed shared token buckets; Phase 5B adds Prometheus instrumentation and a provisioned Grafana dashboard. JWT/OAuth, distributed authentication, adaptive routing, databases, and application containerization remain proposed.
 
 ## 1. High-level system architecture
 
-The Go gateway is the public entry point for client API traffic. It proxies requests to configured Python FastAPI backend instances using Go's standard HTTP reverse-proxy capabilities and selects an instance round-robin from each service's healthy pool. Direct backend `/health` probes update eligibility. Future phases may add additional gateway policies and service-owned domain APIs. Redis is implemented as an optional shared rate-limit store; PostgreSQL is designated for persistent application data and selected configuration. Prometheus/Grafana, Locust, the dashboard, and anomaly-detection component remain planned.
+The Go gateway is the public entry point for client API traffic. It proxies requests to configured Python FastAPI backend instances using Go's standard HTTP reverse-proxy capabilities and selects an instance round-robin from each service's healthy pool. Direct backend `/health` probes update eligibility. A separate metrics listener exposes bounded-cardinality Prometheus metrics; Prometheus and Grafana run in the optional `observability/` Compose stack while the gateway initially runs natively. Redis is implemented as an optional shared rate-limit store; PostgreSQL is designated for persistent application data and selected configuration. Locust, the application dashboard, and anomaly-detection component remain planned.
 
 ```mermaid
 flowchart LR
@@ -17,19 +17,20 @@ flowchart LR
     Product --> PostgreSQL[(PostgreSQL)]
     Order --> PostgreSQL
     User --> PostgreSQL
-    Gateway -. metrics scrape .-> Prometheus[Prometheus]
+    Prometheus -. scrapes /metrics .-> Gateway
     Prometheus --> Grafana[Grafana]
     Locust[Locust] -. planned test traffic .-> Gateway
     Prometheus -. planned signals .-> Anomaly[Python + scikit-learn anomaly analysis]
 ```
 
-**Status note:** Gateway-to-service HTTP connections, API-key authentication, Round Robin selection, active health checks, configurable upstream request timeouts, per-backend circuit breakers, controlled retries, and memory/Redis per-IP rate limiting are implemented. PostgreSQL, Prometheus, Grafana, Locust, dashboard, and anomaly-detection connections remain proposed. No containerized deployment is included.
+**Status note:** Gateway-to-service HTTP connections, API-key authentication, Round Robin selection, active health checks, configurable upstream request timeouts, per-backend circuit breakers, controlled retries, memory/Redis per-IP rate limiting, Prometheus metrics, and the Prometheus/Grafana monitoring stack are implemented. PostgreSQL, Locust, the application dashboard, and anomaly detection remain proposed. Only the monitoring tools are containerized; the gateway and services are run natively.
 
 ### Phase 1/4B.2 runtime configuration
 
 | Component | Local address | Gateway route |
 | --- | --- | --- |
 | Gateway | `http://localhost:8080` | Entry point |
+| Metrics listener | `http://localhost:9091/metrics` | Prometheus scrape endpoint, separate listener |
 | Product Service | `http://localhost:8001` | `/api/v1/products` and descendants |
 | Order Service | `http://localhost:8002` | `/api/v1/orders` and descendants |
 | User Service | `http://localhost:8003` | `/api/v1/users` and descendants |
@@ -48,11 +49,13 @@ API-key authentication is enabled by default. `INTELLIGATE_AUTH_ENABLED=false` e
 
 The gateway protects `/api/v1` and all `/api/v1/*` paths, including future routes. `admin` and `write` allow GET, HEAD, POST, PUT, PATCH, and DELETE; `read` allows only GET and HEAD. Other methods are rejected with 403. Missing or invalid keys return 401; authenticated requests without method permission return 403. Only `GET /health` is public. Roles come only from the authenticated key and are stored in request context; client-supplied role headers/query parameters are not trusted. Do not put real keys in source-controlled configuration. For deployment, provide high-entropy keys through protected secret management and use TLS.
 
+The metrics listener uses `INTELLIGATE_METRICS_LISTEN_ADDR` (default `:9091`) and serves only `GET /metrics`. It is a separate `http.Server`, outside API authentication, authorization, rate limiting, and request instrumentation. It binds and starts with the API listener and shuts down with it; startup/bind errors are reported. The metrics listener has bounded read, write, idle, and header timeouts. Its lack of API authentication is intentional for Prometheus scraping, so restrict port 9091 with host firewall and network controls.
+
 ## 2. Component responsibilities
 
 ### Gateway (Go)
 
-Beyond the Phase 1 behavior below, the gateway is planned to:
+Beyond the Phase 1 behavior below, the gateway is responsible for:
 
 - Expose a public HTTP entry point and statically route the three service prefixes (implemented).
 - Log each request method and path, without query parameters (implemented).
@@ -63,11 +66,11 @@ Beyond the Phase 1 behavior below, the gateway is planned to:
 - Admit only healthy instances whose circuit breaker permits a request (implemented in Phase 3B).
 - Select instances using an adaptive policy (planned; not implemented).
 - Bound upstream proxy requests using the configured timeout (implemented in Phase 3A); preserve 502 for ordinary proxy failures and return 504 when an upstream deadline expires before response headers.
-- Gather latency, request, health, and circuit-breaker metrics.
-- Expose gateway `GET /health` (implemented); readiness and Prometheus metrics endpoints remain planned.
+- Gather HTTP request/status/duration, security-denial, rate-limit, backend-health/selection, breaker, and retry metrics (implemented in Phase 5B).
+- Expose gateway `GET /health` and separate-listener Prometheus `GET /metrics` (implemented); readiness remains planned.
 - Exclude unhealthy instances and restore them after a successful probe (implemented in Phase 2B).
 
-The `proxy`, `router`, `balancer`, `health`, and `circuitbreaker` packages under `gateway/internal/` are implemented. The `middleware` and `metrics` directories remain planned boundaries.
+The `proxy`, `router`, `balancer`, `health`, `circuitbreaker`, and `observability` packages under `gateway/internal/` are implemented. Instrumentation uses injected observers rather than changing routing policy.
 
 ### Backend microservices (Python + FastAPI)
 
@@ -92,9 +95,9 @@ Each service will own its domain API. Service-level validation and persistence d
 
 ## 3. Request lifecycle
 
-The Phase 5A application request path is:
+The Phase 5B application request path is:
 
-1. Receive an HTTP request at port 8080.
+1. Receive an HTTP request at the API listener (default port 8080); the outer instrumentation wrapper records the completed request once, including middleware-generated responses and requests that trigger retries.
 2. Log the method and path without query parameters or credentials.
 3. Validate `X-API-Key` on `/api/v1` and `/api/v1/*`; return 401 for a missing or invalid key. Resolve the role from the key and attach it to the request context. `GET /health` is public.
 4. Authorize the method for that role; return 403 if it is unsupported or not permitted. Client role headers and query parameters are ignored.
@@ -105,11 +108,9 @@ The Phase 5A application request path is:
 
 Separately, the health checker probes every configured instance directly at `/health`. The gateway marks all instances unhealthy before the first probe cycle, completes that cycle before accepting application traffic, then starts periodic checks. Probe status changes update the corresponding selector; later successful probes restore eligibility.
 
-Additional policies in the extended path remain proposed:
+The independent metrics listener serves `/metrics` from a dedicated Prometheus registry. It is not routed through the API handler or counted as a public API request. It exposes Go/process runtime collectors alongside IntelliGate metrics.
 
-1. Add readiness and metrics endpoints with explicit access policies.
-2. Obtain healthy backends and select an instance using an adaptive policy.
-3. Record request outcome, latency, health, and circuit-breaker signals.
+Adaptive backend selection remains proposed. Instrumentation callbacks are bounded and non-sensitive; callbacks that could run near component locks are invoked after releasing those locks, and metrics do not affect routing outcomes.
 
 The gateway applies the controlled retry policy described below after backend selection. It does not infer failures from downstream HTTP status codes.
 
@@ -133,9 +134,10 @@ sequenceDiagram
     participant G as Go Gateway
     participant R as Redis (optional)
     participant LB as Backend Pool / Router
-    participant S as FastAPI Service (planned)
-    participant P as Prometheus (planned)
+    participant S as FastAPI Service
+    participant P as Prometheus
     C->>G: Request
+    G->>G: Capture one HTTP metric around the API handler
     G->>G: Log method/path; do not log credentials
     G->>G: Authenticate API key and resolve role unless GET /health
     G->>G: Authorize method for role
@@ -145,12 +147,12 @@ sequenceDiagram
     LB-->>G: Selected backend
     G->>S: Proxy request
     S-->>G: Response
-    G->>G: Record outcome and latency; update routing signals
+    G->>G: Record final status and duration
     G-->>C: Response
     P->>G: Scrape metrics endpoint
 ```
 
-The diagram represents intended later-phase interactions except for service-route matching, HTTP proxying, per-service Round Robin selection, active health checking, upstream timeouts, circuit-breaker admission, and bounded transport-error retries, which are implemented.
+The metrics scrape is handled by the separate listener and does not pass through the API handler chain shown above. The request lifecycle and all depicted gateway-to-service interactions are implemented, except for future adaptive routing.
 
 ## 4. API key authentication and role authorization (implemented in Phases 4B.1/4B.2)
 
@@ -263,9 +265,40 @@ stateDiagram-v2
 
 Only qualifying upstream transport failures affect the failure count; ordinary application status codes do not.
 
-## 10. Prometheus and Grafana integration
+## 10. Prometheus and Grafana integration (implemented in Phase 5B)
 
-The gateway is planned to expose a Prometheus scrape endpoint with bounded-cardinality metrics for request counts, status classes, latency, rate-limit decisions, backend health, and circuit-breaker state. Avoid labels containing API keys, user identifiers, raw URLs, or other unbounded/sensitive values. Prometheus will scrape the gateway; Grafana will visualize selected series. Scrape configuration, dashboards, retention, and alert rules are not yet present.
+The `gateway/internal/observability` package owns a dedicated Prometheus registry, collectors, bounded-label normalization, observer methods, and the HTTP instrumentation wrapper. `github.com/prometheus/client_golang` supplies the registry/collectors and `github.com/felixge/httpsnoop` wraps `ResponseWriter` while preserving streaming and optional interfaces. The API server stays on its configured address (default `:8080`); the independent metrics listener defaults to `:9091`, has bounded HTTP timeouts, and exposes `GET /metrics` only. Metrics-server startup/bind failure is reported; both servers are shut down gracefully together.
+
+The custom metrics and labels are:
+
+| Metric | Type | Labels |
+| --- | --- | --- |
+| `intelligate_http_requests_total` | Counter | `method`, `route`, `status` |
+| `intelligate_http_request_duration_seconds` | Histogram | `method`, `route` |
+| `intelligate_rate_limit_rejections_total` | Counter | `reason` (`exhausted`, `store_unavailable`) |
+| `intelligate_security_denials_total` | Counter | `stage` (`authentication`, `authorization`), `status` (`401`, `403`) |
+| `intelligate_backend_health` | Gauge | `service`, `backend_id` |
+| `intelligate_backend_health_transitions_total` | Counter | `service`, `backend_id`, `state` (`healthy`, `unhealthy`) |
+| `intelligate_backend_selections_total` | Counter | `service`, `backend_id`, `attempt` (`initial`, `retry`) |
+| `intelligate_backend_selection_failures_total` | Counter | `service`, `reason` (`unhealthy`, `breaker`) |
+| `intelligate_circuit_breaker_state` | One-hot Gauge | `service`, `backend_id`, `state` (`closed`, `open`, `half_open`) |
+| `intelligate_circuit_breaker_transitions_total` | Counter | `service`, `backend_id`, `from`, `to` |
+| `intelligate_upstream_retry_attempts_total` | Counter | `service`, `method` |
+| `intelligate_upstream_retry_outcomes_total` | Counter | `service`, `outcome` (`response`, `transport_error`, `cancelled`, `exhausted`) |
+
+Methods are normalized to known HTTP methods or `OTHER`; routes are normalized to `products`, `orders`, `users`, `health`, or `unmatched`. Backend IDs are stable service-and-index identifiers, never target URLs. HTTP status remains a numeric status label. Raw paths, query strings, client IPs, API keys, role names, and arbitrary errors are not labels. Request metrics count one incoming API request regardless of internal upstream attempts and capture the final gateway status, including 401, 403, 429, 502, 503, and 504. Histograms start at millisecond-scale buckets and extend based on the configured retry budget. Health and one-hot breaker gauges are initialized for configured backends; transition counters count each state-transition notification while generation guards prevent stale gauge writes.
+
+Run the optional monitoring stack from the repository root with environment-provided Grafana credentials:
+
+```powershell
+$env:GRAFANA_ADMIN_USER = "intelligate-admin"
+$env:GRAFANA_ADMIN_PASSWORD = "replace-with-a-strong-local-password"
+docker compose -f observability\docker-compose.yml up -d
+```
+
+The gateway can run natively on Windows; Prometheus scrapes `host.docker.internal:9091` every five seconds. The Compose files publish Prometheus on localhost port 9090 and Grafana on localhost port 3000, persist both services in named volumes, and provision a Prometheus datasource and the IntelliGate Overview dashboard automatically. Grafana credentials are required from environment variables and are not committed. Stop containers with `docker compose -f observability\docker-compose.yml down`; this preserves named volumes.
+
+Metrics are unauthenticated and may reveal aggregate operational behavior. Do not expose port 9091 publicly; apply host firewall/network restrictions. The default listener binds all interfaces, so deployments must explicitly scope the listen address or enforce network restrictions. No alert rules, TLS/authentication on the scrape endpoint, or application dashboard are included.
 
 ## 11. Traffic anomaly detection
 
@@ -275,4 +308,4 @@ A Python component using scikit-learn is planned to explore anomalies in aggrega
 
 **Fixed decisions:** Go gateway; standard-library reverse-proxy capabilities; FastAPI services; per-service Round Robin across configured backend URLs; independent health and circuit-breaker state per backend; Redis-backed distributed rate-limit state; PostgreSQL for persistent records/configuration; Prometheus and Grafana; Locust; future comparison with Adaptive Least-Loaded.
 
-**Open decisions:** Additional local backend port assignments; runtime pool reload; health flapping/hysteresis policy; routing score and EWMA parameters; breaker metrics and policy overrides per service; auth key lifecycle and admin authorization; metrics names and cardinality; dashboard interaction; anomaly model and operation mode.
+**Open decisions:** Additional local backend port assignments; runtime pool reload; health flapping/hysteresis policy; routing score and EWMA parameters; auth key lifecycle and admin authorization; dashboard interaction; anomaly model and operation mode. Metrics are currently process-local observations; multi-gateway metric aggregation depends on Prometheus scraping each instance separately.

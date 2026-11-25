@@ -3,6 +3,7 @@ package balancer
 import (
 	"context"
 	"errors"
+	"log"
 	"math"
 	"net/http"
 	"sync"
@@ -34,6 +35,14 @@ type RoundRobin struct {
 	next     int
 	retries  RetryPolicy
 	wait     func(context.Context, time.Duration) bool
+	observer Observer
+}
+
+type Observer interface {
+	BackendSelected(index int, attempt string)
+	BackendSelectionFailed(reason string)
+	RetryAttempt(method string)
+	RetryOutcome(outcome string)
 }
 
 func NewRoundRobin(backends ...http.Handler) (*RoundRobin, error) {
@@ -130,6 +139,10 @@ func (r *RoundRobin) SetCircuitBreaker(index int, breaker *circuitbreaker.Breake
 	return nil
 }
 
+func (r *RoundRobin) SetObserver(observer Observer) {
+	r.observer = observer
+}
+
 func (r *RoundRobin) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	retryContext, cancelRetryBudget := proxy.WithRetryBudget(req.Context(), r.retries.totalBudget())
 	defer cancelRetryBudget()
@@ -155,6 +168,11 @@ func (r *RoundRobin) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
 		backend, index, permit, anyHealthy, breakerRejected := r.selectBackend(attempted)
 		if backend == nil {
+			reason := "unhealthy"
+			if anyHealthy && breakerRejected {
+				reason = "breaker"
+			}
+			r.observeSelectionFailure(reason)
 			if lastError != nil {
 				lastError.WriteHTTPError(w)
 			} else if anyHealthy && breakerRejected {
@@ -165,6 +183,12 @@ func (r *RoundRobin) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 			return
 		}
 		attempted[index] = true
+		attemptKind := "initial"
+		if attempt > 0 {
+			attemptKind = "retry"
+			r.observeRetryAttempt(req.Method)
+		}
+		r.observeBackendSelected(index, attemptKind)
 
 		if permit != nil {
 			attemptRequest = attemptRequest.WithContext(circuitbreaker.WithPermit(attemptRequest.Context(), permit))
@@ -172,12 +196,25 @@ func (r *RoundRobin) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
 		attemptError := serveAttempt(backend, w, attemptRequest, permit)
 		if proxy.IsClientContextDone(retryContext) {
+			if attempt > 0 {
+				r.observeRetryOutcome("cancelled")
+			}
 			return
 		}
 		if attemptError == nil {
+			if attempt > 0 {
+				r.observeRetryOutcome("response")
+			}
 			return
 		}
 		lastError = attemptError
+		if attempt > 0 {
+			outcome := "transport_error"
+			if attempt == r.retries.MaxRetries {
+				outcome = "exhausted"
+			}
+			r.observeRetryOutcome(outcome)
+		}
 		if proxy.IsRetryBudgetExceeded(retryContext) {
 			writeRetryBudgetTimeout(w)
 			return
@@ -198,6 +235,34 @@ func (r *RoundRobin) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 			return
 		}
 	}
+}
+
+func (r *RoundRobin) observeBackendSelected(index int, attempt string) {
+	r.observe(func(observer Observer) { observer.BackendSelected(index, attempt) })
+}
+
+func (r *RoundRobin) observeSelectionFailure(reason string) {
+	r.observe(func(observer Observer) { observer.BackendSelectionFailed(reason) })
+}
+
+func (r *RoundRobin) observeRetryAttempt(method string) {
+	r.observe(func(observer Observer) { observer.RetryAttempt(method) })
+}
+
+func (r *RoundRobin) observeRetryOutcome(outcome string) {
+	r.observe(func(observer Observer) { observer.RetryOutcome(outcome) })
+}
+
+func (r *RoundRobin) observe(event func(Observer)) {
+	if r.observer == nil {
+		return
+	}
+	defer func() {
+		if recover() != nil {
+			log.Printf("warning: load-balancer metrics observer panicked")
+		}
+	}()
+	event(r.observer)
 }
 
 func (r *RoundRobin) selectBackend(attempted []bool) (http.Handler, int, *circuitbreaker.Permit, bool, bool) {

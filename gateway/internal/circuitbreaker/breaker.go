@@ -3,6 +3,7 @@ package circuitbreaker
 import (
 	"context"
 	"errors"
+	"log"
 	"sync"
 	"time"
 )
@@ -54,6 +55,8 @@ type Breaker struct {
 	halfOpenSuccesses   int
 	generation          uint64
 	now                 func() time.Time
+	observerMu          sync.RWMutex
+	observer            func(from, to State, generation uint64)
 }
 
 func New(config Config) (*Breaker, error) {
@@ -83,48 +86,59 @@ func newWithClock(config Config, now func() time.Time) *Breaker {
 
 func (b *Breaker) State() State {
 	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.advanceCooldownLocked()
-	return b.state
+	from := b.state
+	changed := b.advanceCooldownLocked()
+	state, generation := b.state, b.generation
+	b.mu.Unlock()
+	if changed {
+		b.notifyTransition(from, state, generation)
+	}
+	return state
 }
 
 func (b *Breaker) TryAcquire() (*Permit, bool) {
 	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.advanceCooldownLocked()
-
+	from := b.state
+	changed := b.advanceCooldownLocked()
+	state, generation := b.state, b.generation
+	var permit *Permit
+	allowed := false
 	switch b.state {
 	case StateClosed:
-		return &Permit{breaker: b, generation: b.generation}, true
+		permit, allowed = &Permit{breaker: b, generation: b.generation}, true
 	case StateHalfOpen:
-		if b.halfOpenSuccesses >= b.config.HalfOpenSuccessThreshold ||
-			b.halfOpenInFlight >= b.config.HalfOpenMaxRequests {
-			return nil, false
+		if b.halfOpenSuccesses < b.config.HalfOpenSuccessThreshold &&
+			b.halfOpenInFlight < b.config.HalfOpenMaxRequests {
+			b.halfOpenInFlight++
+			permit, allowed = &Permit{breaker: b, generation: b.generation}, true
 		}
-		b.halfOpenInFlight++
-		return &Permit{breaker: b, generation: b.generation}, true
-	default:
-		return nil, false
 	}
+	b.mu.Unlock()
+	if changed {
+		b.notifyTransition(from, state, generation)
+	}
+	return permit, allowed
 }
 
-func (b *Breaker) advanceCooldownLocked() {
+func (b *Breaker) advanceCooldownLocked() bool {
 	if b.state == StateOpen && !b.now().Before(b.openedAt.Add(b.config.OpenCooldown)) {
 		b.state = StateHalfOpen
 		b.halfOpenInFlight = 0
 		b.halfOpenSuccesses = 0
 		b.generation++
+		return true
 	}
+	return false
 }
 
 func (b *Breaker) finish(generation uint64, result permitResult) {
 	b.mu.Lock()
-	defer b.mu.Unlock()
-
 	if generation != b.generation {
+		b.mu.Unlock()
 		return
 	}
 
+	from := b.state
 	switch b.state {
 	case StateClosed:
 		switch result {
@@ -152,6 +166,32 @@ func (b *Breaker) finish(generation uint64, result permitResult) {
 			b.closeLocked()
 		}
 	}
+	to, currentGeneration := b.state, b.generation
+	b.mu.Unlock()
+	if from != to {
+		b.notifyTransition(from, to, currentGeneration)
+	}
+}
+
+func (b *Breaker) SetTransitionObserver(observer func(from, to State, generation uint64)) {
+	b.observerMu.Lock()
+	b.observer = observer
+	b.observerMu.Unlock()
+}
+
+func (b *Breaker) notifyTransition(from, to State, generation uint64) {
+	b.observerMu.RLock()
+	observer := b.observer
+	b.observerMu.RUnlock()
+	if observer == nil {
+		return
+	}
+	defer func() {
+		if recover() != nil {
+			log.Printf("warning: circuit-breaker metrics observer panicked")
+		}
+	}()
+	observer(from, to, generation)
 }
 
 func (b *Breaker) openLocked() {

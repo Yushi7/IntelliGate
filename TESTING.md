@@ -1,6 +1,6 @@
 # Testing Strategy
 
-**Status:** Phase 1 includes Go router/proxy tests and pytest service endpoint tests. Phase 2A and 2B include Go Round Robin, active health-check, and gateway integration tests. Phase 3A adds timeout configuration and proxy timeout tests. Phase 3B adds circuit-breaker state, selector, proxy-outcome, and configuration tests. Phase 3C adds controlled retry, deadline, and admission tests. Phase 4A adds in-memory token-bucket, cleanup, configuration, and gateway-middleware tests. Phase 4B.1 adds API-key authentication tests; Phase 4B.2 adds role configuration, per-method authorization, middleware-order, request-context isolation, and gateway integration tests. Phase 5A adds Redis-backed shared-quota, atomicity, TTL, failure-mode, startup, and shutdown tests.
+**Status:** Phase 1 includes Go router/proxy tests and pytest service endpoint tests. Phase 2A and 2B include Go Round Robin, active health-check, and gateway integration tests. Phase 3A adds timeout configuration and proxy timeout tests. Phase 3B adds circuit-breaker state, selector, proxy-outcome, and configuration tests. Phase 3C adds controlled retry, deadline, and admission tests. Phase 4A adds in-memory token-bucket, cleanup, configuration, and gateway-middleware tests. Phase 4B.1 adds API-key authentication tests; Phase 4B.2 adds role configuration, per-method authorization, middleware-order, request-context isolation, and gateway integration tests. Phase 5A adds Redis-backed shared-quota, atomicity, TTL, failure-mode, startup, and shutdown tests. Phase 5B adds Prometheus registry, HTTP/component instrumentation, metrics-listener lifecycle/isolation, concurrency, and monitoring configuration.
 
 ## Principles
 
@@ -12,7 +12,7 @@
 
 ## Go unit testing
 
-Use the Go standard `testing` package for gateway packages. Phase 2B tests health-aware selection and probing. Phase 3A tests timeout configuration, timely/timed-out upstreams, 504 mapping, concurrent request handling, and existing error/path behavior. Phase 3B tests breaker defaults and config validation, consecutive failure threshold and reset, cooldown, HALF-OPEN admission limits, successful close, failed reopen, stale permits, cancellation, concurrent outcomes, backend isolation, Round Robin exclusion/re-entry, health-probe independence, and gateway-vs-application response classification. Phase 3C tests GET/HEAD-only retries, bounded attempts, backoff order/cancellation, replayable request bodies, alternate and single-backend selection, health/breaker admission, HALF-OPEN trials, application-status non-retry, body-stream non-retry, client-vs-gateway deadlines, retry-budget timeout, and permit completion. Phase 4A tests token consumption/refill, Retry-After rounding, per-IP separation and IPv4/IPv6 parsing, concurrent capacity, cleanup, environment validation, disabled behavior, health exemption, spoofed forwarding headers, and rejection before routing. Existing 401, 403, 404, 429, 502, 503, 504, and path/query tests provide regression coverage. JWT/OAuth, distributed shared quotas, adaptive scoring, EWMA, and metrics remain planned.
+Use the Go standard `testing` package for gateway packages. Phase 2B tests health-aware selection and probing. Phase 3A tests timeout configuration, timely/timed-out upstreams, 504 mapping, concurrent request handling, and existing error/path behavior. Phase 3B tests breaker defaults and config validation, consecutive failure threshold and reset, cooldown, HALF-OPEN admission limits, successful close, failed reopen, stale permits, cancellation, concurrent outcomes, backend isolation, Round Robin exclusion/re-entry, health-probe independence, and gateway-vs-application response classification. Phase 3C tests GET/HEAD-only retries, bounded attempts, backoff order/cancellation, replayable request bodies, alternate and single-backend selection, health/breaker admission, HALF-OPEN trials, application-status non-retry, body-stream non-retry, client-vs-gateway deadlines, retry-budget timeout, and permit completion. Phase 4A tests token consumption/refill, Retry-After rounding, per-IP separation and IPv4/IPv6 parsing, concurrent capacity, cleanup, environment validation, disabled behavior, health exemption, spoofed forwarding headers, and rejection before routing. Phase 5B tests final HTTP status/duration capture, bounded method/route labels, preserved streaming/flush behavior, one HTTP metric per request despite retries, backend and breaker state initialization/transitions, retry and security/rate-limit metrics, store failures distinct from quota 429, observer concurrency, label sensitivity, and metrics listener isolation/lifecycle. Existing 401, 403, 404, 429, 502, 503, 504, and path/query tests provide regression coverage. JWT/OAuth, distributed quotas, adaptive scoring, and EWMA remain unimplemented.
 
 ## FastAPI testing with Pytest
 
@@ -27,7 +27,12 @@ Set-Location gateway
 go test ./...
 go test -count=10 ./internal/ratelimit
 go test -count=10 ./internal/auth
+go test -count=10 ./internal/observability
+go test -count=10 ./internal/balancer
+go test -count=10 ./internal/circuitbreaker
+go test -count=10 ./internal/health
 go test -count=10 ./cmd/gateway
+go vet ./...
 go test -race ./...
 Set-Location ..
 ```
@@ -167,7 +172,44 @@ The default is `5s` when `INTELLIGATE_UPSTREAM_TIMEOUT` is unset. The timeout ca
 
 ## Integration testing
 
-Redis-backed rate-limit integration tests use a real Redis instance when available. They create a unique IntelliGate test namespace, clean only keys in that namespace, and never flush a Redis database. Set `INTELLIGATE_TEST_REDIS_ADDR` to use a non-default local test server; otherwise tests try `localhost:6379` and skip Redis-only cases if it is unavailable. PostgreSQL configuration/data access, Prometheus scraping, and deployment readiness remain planned.
+Redis-backed rate-limit integration tests use a real Redis instance when available. They create a unique IntelliGate test namespace, clean only keys in that namespace, and never flush a Redis database. Set `INTELLIGATE_TEST_REDIS_ADDR` to use a non-default local test server; otherwise tests try `localhost:6379` and skip Redis-only cases if it is unavailable. Prometheus registry/handler behavior and API/metrics listener lifecycle have automated tests; live scraping through Docker Desktop and Grafana UI verification require a local monitoring-stack run. PostgreSQL configuration/data access and deployment readiness remain planned.
+
+## Prometheus and Grafana monitoring (Phase 5B)
+
+The gateway API and metrics listener start and shut down together. Metrics are exposed only as `GET /metrics` on the separate `INTELLIGATE_METRICS_LISTEN_ADDR` listener (default `:9091`), not on the authenticated API listener. Automated gateway tests verify startup/bind errors, graceful shutdown, successful scraping without API credentials, and that API auth/RBAC/rate-limit middleware does not wrap the metrics handler. They also verify that rate-limit 503 store errors increment `store_unavailable`, not the 429 `exhausted` reason.
+
+To manually start the monitoring stack from the repository root in PowerShell, set local Grafana credentials first:
+
+```powershell
+$env:GRAFANA_ADMIN_USER = "intelligate-admin"
+$env:GRAFANA_ADMIN_PASSWORD = "replace-with-a-strong-local-password"
+docker compose -f observability\docker-compose.yml up -d
+docker compose -f observability\docker-compose.yml ps
+```
+
+In another terminal, with the backend services running if you want application metrics, start the gateway natively:
+
+```powershell
+Set-Location gateway
+$env:INTELLIGATE_API_KEYS = "local-placeholder-key"
+$env:INTELLIGATE_METRICS_LISTEN_ADDR = ":9091"
+go run .\cmd\gateway
+```
+
+Then verify the scrape endpoint and monitoring UI:
+
+```powershell
+Invoke-WebRequest -UseBasicParsing http://localhost:9091/metrics
+Invoke-WebRequest -UseBasicParsing http://localhost:9090/targets
+```
+
+Prometheus should show the `intelligate-gateway` target as UP. Open `http://localhost:3000`, sign in with the environment-supplied Grafana username/password, and open the provisioned **IntelliGate Overview** dashboard. It includes request rate/total, status distribution, p50/p95/p99 latency, backend health/selection, breaker state/transitions, retry attempts/outcomes, rate-limit rejections, and security denials. Prometheus and Grafana are bound to localhost ports 9090 and 3000; named volumes preserve their data. Clean up the containers without deleting volumes:
+
+```powershell
+docker compose -f observability\docker-compose.yml down
+```
+
+The Prometheus container scrapes the Windows host through `host.docker.internal:9091` every five seconds. The metrics listener has no API-key authentication; firewall or otherwise restrict port 9091 to trusted monitoring clients. A successful local browser/Grafana demonstration is not implied by automated Go tests.
 
 ## Gateway-to-service communication
 
@@ -285,4 +327,4 @@ Inject controlled backend failure, latency, and restart/recovery events in a loc
 
 ## Current status
 
-Phase 1 service tests and Phase 2A/2B/3A/3B/3C/4A/4B.1/4B.2/5A Go routing, health-check, timeout, circuit-breaker, retry, memory/Redis rate-limit, API-key authentication, RBAC, and integration tests are implemented. Record manual verification results in [DEVELOPMENT_LOG.md](./DEVELOPMENT_LOG.md) only after running them. Tests for JWT/OAuth, distributed authentication, databases, adaptive routing, and monitoring are not implemented.
+Phase 1 service tests and Phase 2A/2B/3A/3B/3C/4A/4B.1/4B.2/5A Go routing, health-check, timeout, circuit-breaker, retry, memory/Redis rate-limit, API-key authentication, RBAC, and integration tests are implemented. Record manual verification results in [DEVELOPMENT_LOG.md](./DEVELOPMENT_LOG.md) only after running them. Tests for JWT/OAuth, distributed authentication, databases, and adaptive routing are not implemented.

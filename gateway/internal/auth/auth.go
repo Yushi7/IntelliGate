@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 )
@@ -28,6 +29,11 @@ type credential struct {
 
 type Authenticator struct {
 	credentials []credential
+	onDenial    func(stage string, status int)
+}
+
+func (a *Authenticator) SetDenialObserver(observer func(stage string, status int)) {
+	a.onDenial = observer
 }
 
 func ParseKeys(value string) ([]string, error) {
@@ -210,6 +216,7 @@ func (a *Authenticator) AuthenticationMiddleware(next http.Handler) http.Handler
 		}
 		role, ok := a.roleForRequest(req)
 		if !ok {
+			a.observeDenial("authentication", http.StatusUnauthorized)
 			writeUnauthorized(w)
 			return
 		}
@@ -233,15 +240,29 @@ func (a *Authenticator) AuthorizationMiddleware(next http.Handler) http.Handler 
 		}
 		role, ok := roleFromContext(req.Context())
 		if !ok {
+			a.observeDenial("authentication", http.StatusUnauthorized)
 			writeUnauthorized(w)
 			return
 		}
 		if !roleAllowsMethod(role, req.Method) {
+			a.observeDenial("authorization", http.StatusForbidden)
 			writeForbidden(w)
 			return
 		}
 		next.ServeHTTP(w, req)
 	})
+}
+
+func (a *Authenticator) observeDenial(stage string, status int) {
+	if a.onDenial == nil {
+		return
+	}
+	defer func() {
+		if recover() != nil {
+			log.Printf("warning: authentication metrics observer panicked")
+		}
+	}()
+	a.onDenial(stage, status)
 }
 
 func requiresAPIKey(path string) bool {

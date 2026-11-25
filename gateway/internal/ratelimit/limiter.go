@@ -72,6 +72,11 @@ type Limiter struct {
 	config      Config
 	store       Store
 	memoryStore *MemoryStore
+	onRejection func(reason string)
+}
+
+func (l *Limiter) SetRejectionObserver(observer func(reason string)) {
+	l.onRejection = observer
 }
 
 func New(config Config) (*Limiter, error) {
@@ -177,6 +182,7 @@ func (l *Limiter) Middleware(next http.Handler) http.Handler {
 			if r.Context().Err() != nil {
 				return
 			}
+			l.observeRejection("store_unavailable")
 			if l.config.FailureMode == FailureModeOpen {
 				log.Printf("warning: rate-limit store unavailable; allowing request in open mode")
 				next.ServeHTTP(w, r)
@@ -187,6 +193,7 @@ func (l *Limiter) Middleware(next http.Handler) http.Handler {
 			return
 		}
 		if !allowed {
+			l.observeRejection("exhausted")
 			w.Header().Set("Retry-After", strconv.FormatInt(retryAfter, 10))
 			writeJSONError(w, http.StatusTooManyRequests, "rate limit exceeded")
 			return
@@ -194,6 +201,18 @@ func (l *Limiter) Middleware(next http.Handler) http.Handler {
 
 		next.ServeHTTP(w, r)
 	})
+}
+
+func (l *Limiter) observeRejection(reason string) {
+	if l.onRejection == nil {
+		return
+	}
+	defer func() {
+		if recover() != nil {
+			log.Printf("warning: rate-limit metrics observer panicked")
+		}
+	}()
+	l.onRejection(reason)
 }
 
 func writeJSONError(w http.ResponseWriter, status int, message string) {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"net/url"
 	"strings"
@@ -17,14 +18,19 @@ const (
 )
 
 type Backend struct {
-	URL        *url.URL
-	SetHealthy func(bool) error
+	URL          *url.URL
+	SetHealthy   func(bool) error
+	OnTransition func(healthy bool, generation uint64)
 }
 
 type Checker struct {
-	backends []Backend
-	client   *http.Client
-	interval time.Duration
+	backends    []Backend
+	client      *http.Client
+	interval    time.Duration
+	checkMu     sync.Mutex
+	stateMu     sync.Mutex
+	states      []bool
+	generations []uint64
 }
 
 func NewChecker(backends []Backend, interval, timeout time.Duration) (*Checker, error) {
@@ -59,7 +65,11 @@ func NewChecker(backends []Backend, interval, timeout time.Duration) (*Checker, 
 		healthURL.ForceQuery = false
 		healthURL.Fragment = ""
 		healthURL.RawFragment = ""
-		copiedBackends[i] = Backend{URL: &healthURL, SetHealthy: backend.SetHealthy}
+		copiedBackends[i] = Backend{
+			URL:          &healthURL,
+			SetHealthy:   backend.SetHealthy,
+			OnTransition: backend.OnTransition,
+		}
 	}
 
 	return &Checker{
@@ -70,14 +80,24 @@ func NewChecker(backends []Backend, interval, timeout time.Duration) (*Checker, 
 				return http.ErrUseLastResponse
 			},
 		},
-		interval: interval,
+		interval:    interval,
+		states:      make([]bool, len(copiedBackends)),
+		generations: make([]uint64, len(copiedBackends)),
 	}, nil
 }
 
 func (c *Checker) CheckNow(ctx context.Context) error {
+	c.checkMu.Lock()
 	var workers sync.WaitGroup
 	errs := make(chan error, len(c.backends))
-	for _, backend := range c.backends {
+	type transition struct {
+		backend    Backend
+		healthy    bool
+		generation uint64
+	}
+	transitions := make(chan transition, len(c.backends))
+	for index, backend := range c.backends {
+		index := index
 		backend := backend
 		workers.Add(1)
 		go func() {
@@ -85,17 +105,46 @@ func (c *Checker) CheckNow(ctx context.Context) error {
 			healthy := c.probe(ctx, backend.URL)
 			if err := backend.SetHealthy(healthy); err != nil {
 				errs <- fmt.Errorf("update health for backend %q: %w", backend.URL, err)
+				return
+			}
+			c.stateMu.Lock()
+			changed := c.states[index] != healthy
+			if changed {
+				c.states[index] = healthy
+				c.generations[index]++
+			}
+			generation := c.generations[index]
+			c.stateMu.Unlock()
+			if changed && backend.OnTransition != nil {
+				transitions <- transition{backend: backend, healthy: healthy, generation: generation}
 			}
 		}()
 	}
 	workers.Wait()
 	close(errs)
+	close(transitions)
+	c.checkMu.Unlock()
 
 	var failures []error
 	for err := range errs {
 		failures = append(failures, err)
 	}
+	for event := range transitions {
+		notifyHealthTransition(event.backend.OnTransition, event.healthy, event.generation)
+	}
 	return errors.Join(failures...)
+}
+
+func notifyHealthTransition(observer func(bool, uint64), healthy bool, generation uint64) {
+	if observer == nil {
+		return
+	}
+	defer func() {
+		if recover() != nil {
+			log.Printf("warning: backend health metrics observer panicked")
+		}
+	}()
+	observer(healthy, generation)
 }
 
 func (c *Checker) Run(ctx context.Context) error {

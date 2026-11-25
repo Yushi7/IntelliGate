@@ -4,7 +4,7 @@
 
 IntelliGate is an API gateway and demonstration environment for routing traffic to an e-commerce application's Product, Order, and User services. The project is being built to explore secure client access, traffic management, service resilience, and observability in a modular microservices system.
 
-> **Phase 5A status:** The Go gateway and three FastAPI demonstration services are implemented. The gateway uses configurable per-service Round Robin pools, active health checks, upstream request timeouts, per-backend circuit breakers, bounded retries for eligible GET/HEAD transport failures, API-key authentication with role-based access control, and per-client-IP token-bucket rate limiting backed by either memory or Redis. JWT/OAuth, distributed authentication, adaptive routing, persistence, monitoring, dashboard, and deployment features remain planned.
+> **Phase 5B status:** The Go gateway and three FastAPI demonstration services are implemented. The gateway uses configurable per-service Round Robin pools, active health checks, upstream request timeouts, per-backend circuit breakers, bounded retries for eligible GET/HEAD transport failures, API-key authentication with role-based access control, and per-client-IP token-bucket rate limiting backed by either memory or Redis. Prometheus metrics and a provisioned Grafana overview dashboard are implemented. JWT/OAuth, distributed authentication, adaptive routing, persistence, application containerization, and anomaly detection remain planned.
 
 ## Problem
 
@@ -40,7 +40,7 @@ Microservice applications need a consistent entry point to authenticate clients,
 | Circuit breaker | Implemented in Phase 3B |
 | Controlled upstream retries | Implemented in Phase 3C |
 | In-memory rate limiting | Implemented in Phase 4A |
-| Prometheus metrics and Grafana dashboards | Planned |
+| Prometheus metrics and Grafana overview dashboard | Implemented in Phase 5B |
 | Traffic anomaly detection using Python and scikit-learn | Planned |
 | Product, Order, and User FastAPI services | Implemented in Phase 1 |
 | React + TypeScript dashboard | Planned |
@@ -53,7 +53,7 @@ Clients send service requests to the Go gateway on port 8080 by default; `INTELL
 
 Rate limiting is enabled by default. The `memory` store applies 10 tokens/second with a burst of 20 per client IP and is process-local. Set `INTELLIGATE_RATE_LIMIT_STORE=redis` to share buckets through Redis; configure its address, optional password, and database with `INTELLIGATE_REDIS_ADDR`, `INTELLIGATE_REDIS_PASSWORD`, and `INTELLIGATE_REDIS_DB`. Redis mode performs a bounded startup check and never silently falls back to memory. Failure mode is `closed` by default (HTTP 503 on Redis errors) or may be set to `open` (log a generic warning and allow the request). `GET /health` bypasses rate limiting in either mode. Client identity comes from the canonical IP parsed from `RemoteAddr`; forwarded-IP headers are not trusted. Idle state expires after 10 minutes; only memory mode runs a cleanup loop. A denied request receives HTTP 429 with a positive `Retry-After`.
 
-The gateway round-robins among configured instances that pass direct `/health` checks and have an available circuit-breaker permit. Breakers are per instance: after 5 qualifying transport failures, an instance is excluded for a 10-second cooldown before a half-open trial is allowed. A failed trial reopens it; the configured number of complete upstream responses closes it. Configure thresholds with the `INTELLIGATE_CIRCUIT_BREAKER_*` environment variables. A 5-second upstream timeout is the default (`INTELLIGATE_UPSTREAM_TIMEOUT` overrides it); GET and HEAD requests retry eligible pre-header transport failures up to twice, with 100ms and 200ms backoffs. The overall retry budget is `(3 × upstream timeout) + 300ms` (15.3 seconds by default). GET/HEAD bodies require `GetBody` for replay. Completed application responses and response-body streaming failures are not retried. Timeout before headers returns 504, exhausted ordinary proxy failures return 502, and no initially eligible backend returns 503. Gateway `GET /health` remains independent of backend state. PostgreSQL, Prometheus, and Grafana integrations remain planned. See [ARCHITECTURE.md](./ARCHITECTURE.md) for details.
+The gateway round-robins among configured instances that pass direct `/health` checks and have an available circuit-breaker permit. Breakers are per instance: after 5 qualifying transport failures, an instance is excluded for a 10-second cooldown before a half-open trial is allowed. A failed trial reopens it; the configured number of complete upstream responses closes it. Configure thresholds with the `INTELLIGATE_CIRCUIT_BREAKER_*` environment variables. A 5-second upstream timeout is the default (`INTELLIGATE_UPSTREAM_TIMEOUT` overrides it); GET and HEAD requests retry eligible pre-header transport failures up to twice, with 100ms and 200ms backoffs. The overall retry budget is `(3 × upstream timeout) + 300ms` (15.3 seconds by default). GET/HEAD bodies require `GetBody` for replay. Completed application responses and response-body streaming failures are not retried. Timeout before headers returns 504, exhausted ordinary proxy failures return 502, and no initially eligible backend returns 503. Gateway `GET /health` remains independent of backend state. The API listens on `:8080`; a separate metrics listener defaults to `:9091` and exposes Prometheus at `/metrics`, outside API authentication and rate limiting. Restrict its network access because it is unauthenticated. See [ARCHITECTURE.md](./ARCHITECTURE.md) for details.
 
 ## Technology stack
 
@@ -91,13 +91,14 @@ IntelliGate/
 │       ├── middleware/ # planned
 │       ├── health/     # active backend probes
 │       ├── circuitbreaker/ # per-backend circuit state
-│       └── metrics/    # planned
+│       └── observability/ # Prometheus metrics and observers
 ├── services/
 │   ├── product-service/{main.py,requirements.txt,test_main.py}
 │   ├── order-service/{main.py,requirements.txt,test_main.py}
 │   └── user-service/{main.py,requirements.txt,test_main.py}
 ├── dashboard/
-├── monitoring/
+├── observability/
+│   ├── docker-compose.yml
 │   ├── prometheus/
 │   └── grafana/
 ├── load-tests/
@@ -113,7 +114,7 @@ IntelliGate/
 └── API_DOCUMENTATION.md
 ```
 
-Phase 0 created the directory structure; Phase 1 adds gateway and service source under those directories. `docker-compose.yml` remains deferred until a verified containerized environment is designed.
+The `observability/` Compose stack runs only Prometheus and Grafana; the gateway and services remain native processes. No application-service containerization is included.
 
 ## Development roadmap
 
@@ -130,10 +131,11 @@ Phase 0 created the directory structure; Phase 1 adds gateway and service source
 | 4B.1 | Add API key authentication for gateway API routes | Implemented; tests included |
 | 4B.2 | Add role-based access control for API keys | Implemented; tests included |
 | 5A | Add optional Redis-backed shared token-bucket rate limiting | Implemented; tests included |
-| Later | Add JWT/OAuth, distributed authentication, adaptive routing, and metrics | Pending |
+| 5B | Add Prometheus metrics and provisioned Grafana monitoring | Implemented; tests included |
+| Later | Add JWT/OAuth, distributed authentication, and adaptive routing | Pending |
 | Later | Add dashboard, anomaly detection, load experiments, and deployment automation | Pending |
 
-Phase 1, Phase 2A, Phase 2B, Phase 3A, Phase 3B, Phase 3C, Phase 4A, Phase 4B.1, Phase 4B.2, and Phase 5A implementations are recorded below. Later-phase work remains pending.
+Phase 1, Phase 2A, Phase 2B, Phase 3A, Phase 3B, Phase 3C, Phase 4A, Phase 4B.1, Phase 4B.2, Phase 5A, and Phase 5B implementations are recorded below. Later-phase work remains pending.
 
 ## Run locally
 
@@ -197,14 +199,33 @@ Set `INTELLIGATE_RATE_LIMIT_STORE=redis` and optionally `INTELLIGATE_REDIS_ADDR`
 
 ## Prerequisites
 
-For the gateway and services in default memory mode, install Go and Python. Docker and Redis are optional, but Redis must be reachable when `INTELLIGATE_RATE_LIMIT_STORE=redis`. Node.js, PostgreSQL, and Locust are not required for the implemented runtime.
+For the gateway and services in default memory mode, install Go and Python. Docker is needed for the optional Prometheus/Grafana monitoring stack; Redis is optional, but must be reachable when `INTELLIGATE_RATE_LIMIT_STORE=redis`. Node.js, PostgreSQL, and Locust are not required for the implemented runtime.
 
-## Future execution
+## Prometheus and Grafana monitoring
 
-There is no Docker deployment configuration. Run the gateway and services directly as described below.
+The gateway's metrics listener defaults to `:9091` and is separate from the API listener. Start the monitoring stack from the repository root after setting local Grafana credentials:
+
+```powershell
+$env:GRAFANA_ADMIN_USER = "intelligate-admin"
+$env:GRAFANA_ADMIN_PASSWORD = "replace-with-a-strong-local-password"
+docker compose -f observability\docker-compose.yml up -d
+```
+
+In another PowerShell terminal, run the gateway natively from the `gateway` directory (and configure the API key as usual):
+
+```powershell
+Set-Location gateway
+$env:INTELLIGATE_API_KEYS = "local-placeholder-key"
+$env:INTELLIGATE_METRICS_LISTEN_ADDR = ":9091"
+go run .\cmd\gateway
+```
+
+Prometheus scrapes `host.docker.internal:9091` every five seconds; open Prometheus at `http://localhost:9090` and Grafana at `http://localhost:3000`. Sign in with the credentials set in the shell that starts Compose; the IntelliGate Overview dashboard is provisioned automatically. Metrics are not API-authenticated, so restrict access to port 9091 using host firewall/network controls. Stop the monitoring containers with `docker compose -f observability\docker-compose.yml down`; named data volumes are retained.
+
+The custom metric families cover `intelligate_http_requests_total`, `intelligate_http_request_duration_seconds`, `intelligate_rate_limit_rejections_total`, `intelligate_security_denials_total`, `intelligate_backend_health`, `intelligate_backend_health_transitions_total`, `intelligate_backend_selections_total`, `intelligate_backend_selection_failures_total`, `intelligate_circuit_breaker_state`, `intelligate_circuit_breaker_transitions_total`, `intelligate_upstream_retry_attempts_total`, and `intelligate_upstream_retry_outcomes_total`. Labels use normalized methods/routes, status/reason/stage/state/outcome, service, and stable backend IDs only; raw URLs, IPs, API keys, and arbitrary errors are never labels. See [API_DOCUMENTATION.md](./API_DOCUMENTATION.md) for types and label sets.
 
 ## Current implementation status
 
-- **Implemented:** Phase 1 Go reverse proxy and three FastAPI services; Phase 2A per-service Round Robin; Phase 2B health checks and health-aware selection; Phase 3A configurable upstream request timeout; Phase 3B per-backend circuit breakers; Phase 3C bounded controlled retries; Phase 4A in-memory per-client-IP token bucket; Phase 4B.1 API-key authentication; Phase 4B.2 role-based access control; Phase 5A optional Redis-backed shared token buckets.
-- **Not implemented:** JWT/OAuth, distributed authentication, adaptive routing, database integration, monitoring, dashboard, load tests, Docker Compose configuration, and CI/CD workflows.
+- **Implemented:** Phase 1 Go reverse proxy and three FastAPI services; Phase 2A per-service Round Robin; Phase 2B health checks and health-aware selection; Phase 3A configurable upstream request timeout; Phase 3B per-backend circuit breakers; Phase 3C bounded controlled retries; Phase 4A in-memory per-client-IP token bucket; Phase 4B.1 API-key authentication; Phase 4B.2 role-based access control; Phase 5A optional Redis-backed shared token buckets; Phase 5B Prometheus instrumentation and Grafana monitoring stack.
+- **Not implemented:** JWT/OAuth, distributed authentication, adaptive routing, database integration, application containerization, load tests, and CI/CD workflows.
 - **Verification:** Current test and manual integration procedures are recorded in [TESTING.md](./TESTING.md); actual run results are recorded in [DEVELOPMENT_LOG.md](./DEVELOPMENT_LOG.md).

@@ -75,6 +75,82 @@ func TestOnlyGETAndHEADAreRetried(t *testing.T) {
 	}
 }
 
+func TestObserverRecordsSelectionsAndRetryEventsWithoutCountingInitialAttempt(t *testing.T) {
+	policy := DefaultRetryPolicy(time.Second)
+	policy.Backoffs = []time.Duration{0, 0}
+	selector, err := NewRoundRobinWithRetryPolicy(policy,
+		&scriptedAttemptHandler{
+			attempt: func(http.ResponseWriter, *http.Request) *proxy.AttemptError {
+				return testAttemptFailure(http.StatusBadGateway)
+			},
+		},
+		&scriptedAttemptHandler{
+			attempt: func(w http.ResponseWriter, _ *http.Request) *proxy.AttemptError {
+				w.WriteHeader(http.StatusNoContent)
+				return nil
+			},
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	observer := &recordingObserver{}
+	selector.SetObserver(observer)
+	selector.wait = func(context.Context, time.Duration) bool { return true }
+
+	recorder := httptest.NewRecorder()
+	selector.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/", nil))
+	if recorder.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204 from retry response", recorder.Code)
+	}
+	if got, want := fmt.Sprint(observer.selected), "[0:initial 1:retry]"; got != want {
+		t.Fatalf("selection events = %s, want %s", got, want)
+	}
+	if got := observer.retryAttempts; len(got) != 1 || got[0] != http.MethodGet {
+		t.Fatalf("retry attempts = %v, want exactly one GET retry", got)
+	}
+	if got, want := fmt.Sprint(observer.retryOutcomes), "[response]"; got != want {
+		t.Fatalf("retry outcomes = %s, want %s", got, want)
+	}
+}
+
+func TestObserverRecordsTransportErrorAndExhaustedRetryOutcomesOnce(t *testing.T) {
+	policy := DefaultRetryPolicy(time.Second)
+	policy.Backoffs = []time.Duration{0, 0}
+	selector, err := NewRoundRobinWithRetryPolicy(policy, &scriptedAttemptHandler{
+		attempt: func(http.ResponseWriter, *http.Request) *proxy.AttemptError {
+			return testAttemptFailure(http.StatusBadGateway)
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	observer := &recordingObserver{}
+	selector.SetObserver(observer)
+	selector.wait = func(context.Context, time.Duration) bool { return true }
+	selector.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/", nil))
+
+	if len(observer.retryAttempts) != 2 {
+		t.Fatalf("retry attempts = %d, want 2", len(observer.retryAttempts))
+	}
+	if got, want := fmt.Sprint(observer.retryOutcomes), "[transport_error exhausted]"; got != want {
+		t.Fatalf("retry outcomes = %s, want %s", got, want)
+	}
+}
+
+func TestPanickingObserverDoesNotChangeBackendSelection(t *testing.T) {
+	selector, err := NewRoundRobin(identifiedBackend("backend"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	selector.SetObserver(panickingObserver{})
+	recorder := httptest.NewRecorder()
+	selector.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status with panicking observer = %d, want 200", recorder.Code)
+	}
+}
+
 func TestRetryBackoffOrderAndCancellation(t *testing.T) {
 	policy := DefaultRetryPolicy(time.Second)
 	var attempts atomic.Int32
@@ -781,3 +857,33 @@ func (h *scriptedAttemptHandler) ServeAttempt(w http.ResponseWriter, req *http.R
 func testAttemptFailure(status int) *proxy.AttemptError {
 	return &proxy.AttemptError{StatusCode: status, Err: errors.New("upstream transport failed")}
 }
+
+type recordingObserver struct {
+	selected      []string
+	retryAttempts []string
+	retryOutcomes []string
+	failures      []string
+}
+
+func (o *recordingObserver) BackendSelected(index int, attempt string) {
+	o.selected = append(o.selected, fmt.Sprintf("%d:%s", index, attempt))
+}
+
+func (o *recordingObserver) BackendSelectionFailed(reason string) {
+	o.failures = append(o.failures, reason)
+}
+
+func (o *recordingObserver) RetryAttempt(method string) {
+	o.retryAttempts = append(o.retryAttempts, method)
+}
+
+func (o *recordingObserver) RetryOutcome(outcome string) {
+	o.retryOutcomes = append(o.retryOutcomes, outcome)
+}
+
+type panickingObserver struct{}
+
+func (panickingObserver) BackendSelected(int, string)   { panic("observer failure") }
+func (panickingObserver) BackendSelectionFailed(string) { panic("observer failure") }
+func (panickingObserver) RetryAttempt(string)           { panic("observer failure") }
+func (panickingObserver) RetryOutcome(string)           { panic("observer failure") }

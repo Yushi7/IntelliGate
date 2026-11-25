@@ -110,6 +110,62 @@ func TestCooldownAdmitsHalfOpenTrial(t *testing.T) {
 	}
 }
 
+func TestTransitionObserverReportsActualStateChanges(t *testing.T) {
+	config := DefaultConfig()
+	config.FailureThreshold = 1
+	breaker, now := newTestBreaker(t, config)
+	type event struct {
+		from       State
+		to         State
+		generation uint64
+	}
+	var events []event
+	breaker.SetTransitionObserver(func(from, to State, generation uint64) {
+		events = append(events, event{from: from, to: to, generation: generation})
+	})
+
+	permit, allowed := breaker.TryAcquire()
+	if !allowed {
+		t.Fatal("closed breaker rejected request")
+	}
+	permit.Failure()
+	*now = now.Add(config.OpenCooldown)
+	trial, allowed := breaker.TryAcquire()
+	if !allowed {
+		t.Fatal("breaker rejected half-open trial after cooldown")
+	}
+	trial.Success()
+
+	want := []event{
+		{from: StateClosed, to: StateOpen, generation: 1},
+		{from: StateOpen, to: StateHalfOpen, generation: 2},
+		{from: StateHalfOpen, to: StateClosed, generation: 3},
+	}
+	if len(events) != len(want) {
+		t.Fatalf("transition event count = %d, want %d", len(events), len(want))
+	}
+	for i := range want {
+		if events[i] != want[i] {
+			t.Errorf("transition event %d = %+v, want %+v", i, events[i], want[i])
+		}
+	}
+}
+
+func TestTransitionObserverPanicDoesNotChangeBreakerOutcome(t *testing.T) {
+	config := DefaultConfig()
+	config.FailureThreshold = 1
+	breaker, _ := newTestBreaker(t, config)
+	breaker.SetTransitionObserver(func(State, State, uint64) { panic("observer failure") })
+	permit, allowed := breaker.TryAcquire()
+	if !allowed {
+		t.Fatal("breaker rejected request before failure threshold")
+	}
+	permit.Failure()
+	if got := breaker.State(); got != StateOpen {
+		t.Fatalf("breaker state after observer panic = %s, want open", got)
+	}
+}
+
 func TestHalfOpenConcurrentTrialLimit(t *testing.T) {
 	config := DefaultConfig()
 	breaker, now := newTestBreaker(t, config)

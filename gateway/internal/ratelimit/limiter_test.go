@@ -2,9 +2,11 @@ package ratelimit
 
 import (
 	"context"
+	"errors"
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -272,6 +274,86 @@ func TestMiddlewareRejectsMalformedRemoteAddr(t *testing.T) {
 	}
 	if called {
 		t.Fatal("malformed remote address reached downstream")
+	}
+}
+
+func TestRejectionObserverDistinguishesQuotaAndStoreFailures(t *testing.T) {
+	config := DefaultConfig()
+	config.Rate = 0.000001
+	config.Burst = 1
+	limiter, err := New(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var reasons []string
+	limiter.SetRejectionObserver(func(reason string) {
+		reasons = append(reasons, reason)
+	})
+	handler := limiter.Middleware(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	for i := 0; i < 2; i++ {
+		request := httptest.NewRequest(http.MethodGet, "/api/v1/products", nil)
+		request.RemoteAddr = "192.0.2.15:1234"
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, request)
+		if i == 0 && recorder.Code != http.StatusNoContent {
+			t.Fatalf("first request status = %d, want 204", recorder.Code)
+		}
+		if i == 1 && recorder.Code != http.StatusTooManyRequests {
+			t.Fatalf("exhausted request status = %d, want 429", recorder.Code)
+		}
+	}
+	if got := strings.Join(reasons, ","); got != "exhausted" {
+		t.Fatalf("rejection observer reasons = %q, want exhausted", got)
+	}
+}
+
+func TestPanickingRejectionObserverDoesNotChangeRateLimitOutcome(t *testing.T) {
+	config := DefaultConfig()
+	config.Rate = 0.000001
+	config.Burst = 1
+	limiter, err := New(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	limiter.SetRejectionObserver(func(string) { panic("observer failure") })
+	handler := limiter.Middleware(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	for i, want := range []int{http.StatusNoContent, http.StatusTooManyRequests} {
+		request := httptest.NewRequest(http.MethodGet, "/api/v1/products", nil)
+		request.RemoteAddr = "192.0.2.16:1234"
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, request)
+		if recorder.Code != want {
+			t.Fatalf("request %d status with panicking observer = %d, want %d", i+1, recorder.Code, want)
+		}
+	}
+}
+
+func TestStoreUnavailableIsObservedSeparatelyFromQuotaExhaustion(t *testing.T) {
+	config := DefaultConfig()
+	limiter, err := NewWithStore(config, &scriptedStore{err: errors.New("private Redis detail")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var reasons []string
+	limiter.SetRejectionObserver(func(reason string) {
+		reasons = append(reasons, reason)
+	})
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/products", nil)
+	request.RemoteAddr = "192.0.2.17:1234"
+	recorder := httptest.NewRecorder()
+	limiter.Middleware(http.NotFoundHandler()).ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("store error status = %d, want 503", recorder.Code)
+	}
+	if got := strings.Join(reasons, ","); got != "store_unavailable" {
+		t.Fatalf("store error observer reasons = %q, want store_unavailable", got)
+	}
+	if strings.Contains(recorder.Body.String(), "private Redis detail") {
+		t.Fatal("store error response exposed internal error details")
 	}
 }
 
