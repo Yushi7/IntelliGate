@@ -4,12 +4,12 @@
 
 ## 1. High-level system architecture
 
-The Go gateway is the public entry point for client API traffic. It proxies requests to configured Python FastAPI backend instances using Go's standard HTTP reverse-proxy capabilities and selects an instance using health- and breaker-aware Round Robin by default, or adaptive latency/load scoring when configured. Direct backend `/health` probes update eligibility. A separate metrics listener exposes bounded-cardinality Prometheus metrics; Prometheus and Grafana run in the optional `observability/` Compose stack while the gateway initially runs natively. Redis is implemented as an optional shared rate-limit store; PostgreSQL is designated for persistent application data and selected configuration. Locust, the application dashboard, and anomaly-detection component remain planned.
+The Go gateway is the public entry point for client API traffic. It proxies requests to configured Python FastAPI backend instances using Go's standard HTTP reverse-proxy capabilities and selects an instance using health- and breaker-aware Round Robin by default, or adaptive latency/load scoring when configured. Direct backend `/health` probes update eligibility. A separate metrics listener exposes bounded-cardinality Prometheus metrics; Prometheus and Grafana run in the optional `observability/` Compose stack while the gateway initially runs natively. Redis is implemented as an optional shared rate-limit store; PostgreSQL is designated for persistent application data and selected configuration. The React monitoring dashboard and Locust benchmark workload are implemented; anomaly detection remains planned.
 
 ```mermaid
 flowchart LR
     Client[API Client] -->|HTTP API requests| Gateway[Go API Gateway]
-    Dashboard[React + TypeScript Dashboard] -. planned administration / views .-> Gateway
+    Dashboard[React monitoring dashboard] -. reads gateway health .-> Gateway
     Gateway -->|proxy| Product[Product FastAPI Service]
     Gateway -->|proxy| Order[Order FastAPI Service]
     Gateway -->|proxy| User[User FastAPI Service]
@@ -18,12 +18,13 @@ flowchart LR
     Order --> PostgreSQL
     User --> PostgreSQL
     Prometheus -. scrapes /metrics .-> Gateway
+    Dashboard -. reads metrics .-> Prometheus
     Prometheus --> Grafana[Grafana]
-    Locust[Locust] -. planned test traffic .-> Gateway
+    Locust[Locust benchmark workload] -. authenticated GET traffic .-> Gateway
     Prometheus -. planned signals .-> Anomaly[Python + scikit-learn anomaly analysis]
 ```
 
-**Status note:** Gateway-to-service HTTP connections, API-key authentication, Round Robin selection, active health checks, configurable upstream request timeouts, per-backend circuit breakers, controlled retries, memory/Redis per-IP rate limiting, Prometheus metrics, and the Prometheus/Grafana monitoring stack are implemented. PostgreSQL, Locust, the application dashboard, and anomaly detection remain proposed. Only the monitoring tools are containerized; the gateway and services are run natively.
+**Status note:** Gateway-to-service HTTP connections, API-key authentication, Round Robin and opt-in adaptive selection, active health checks, configurable upstream request timeouts, per-backend circuit breakers, controlled retries, memory/Redis per-IP rate limiting, Prometheus metrics, the Prometheus/Grafana monitoring stack, the React monitoring dashboard, and the Locust benchmark workload are implemented. PostgreSQL persistence and anomaly detection remain proposed. Only the monitoring tools are containerized; the gateway and services are run natively. Benchmark measurements remain pending until scenarios are run and recorded.
 
 ### Phase 1/4B.2 runtime configuration
 

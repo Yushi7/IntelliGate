@@ -1,12 +1,12 @@
 # Performance Evaluation Methodology
 
-**Status:** Proposed benchmark methodology. A limited manual Round Robin demonstration is recorded below; no performance benchmark results are claimed.
+**Status:** Phase 8 Locust workload and comparison tooling are implemented. Benchmark results remain pending until measured runs are recorded. The limited manual Round Robin demonstration below is not a performance benchmark.
 
 ## Research question
 
 Under equivalent backend pools and controlled workloads, how do Round Robin and Adaptive Least-Loaded routing compare in request distribution, throughput, latency, errors, and recovery behavior?
 
-## Planned tool and setup
+## Tool and setup
 
 Use Locust to generate controlled HTTP traffic through the gateway. Run the same service instances, request mix, resource limits, test duration, warm-up, and concurrency profile for each routing policy. Record environment details, software revisions, configuration, workload parameters, and failure injection conditions so runs can be interpreted and repeated.
 
@@ -32,7 +32,9 @@ Avoid changing multiple independent variables between comparison runs. Repeat ru
 4. **Rate-limit verification:** Drive known per-client request rates around configured policy limits.
 5. **Failure and recovery:** Make a backend unavailable and restore it; record detection, exclusion, and recovery timing.
 
-Scenario-specific values, instance counts, and duration will be set after implementation and recorded with the actual run.
+The current automated workload issues equal-weight GET requests to Product, Order, and User routes, with a 100–300 ms per-user wait. Users, spawn rate, a separate warm-up duration, and measured duration are passed to `load-tests/run_benchmark.ps1`. The runner verifies `intelligate_routing_strategy_info`, runs warm-up in a separate Locust process with no measured CSV output, then saves measured Locust output and metadata under `benchmark-results/phase-8/`. Warm-up exercises the gateway and lets adaptive mode gather samples, but the measured process starts fresh Locust clients. Before/after Prometheus snapshots include backend selections, health, breaker state, EWMA latency, in-flight requests, successful samples, rate-limit rejections, and gateway process start time. See `TESTING.md` for exact PowerShell commands. The comparison script rejects incomplete results and mismatches in workload, addresses, backend URL declarations, and recorded rate-limit, retry, timeout, and breaker configuration.
+
+The baseline and Adaptive runs must use the same gateway/API key, backend URL lists and instance counts, health state, retry and breaker settings, rate-limit policy, host resources, Locust workload, users, spawn rate, warm-up, and measured duration. Only `INTELLIGATE_ROUTING_STRATEGY` should differ. Backend URLs and configuration are operator-declared mirrors of gateway startup settings: health series can confirm IDs/counts and current health, but cannot prove that the gateway actually uses the declared URL strings. Compare on a controlled local setup and verify the gateway startup environment yourself. Locust reports end-to-end client latency, while gateway EWMA reports upstream TTFB; these measure different boundaries. Prometheus counter snapshots bracket the measured interval, with scrape cadence and requests already in flight limiting exact boundary precision. The runner preserves default rate limiting and defaults (10 tokens/second, burst 20) are unchanged. The documented routing benchmark explicitly sets the limiter to 1000/1000 while keeping it enabled; this is supported by both memory mode and Redis fixed-point bounds. HTTP 429 responses remain failures. If 429s occur, treat the run as limiter-constrained and do not present it as an unconstrained routing comparison.
 
 ## Phase 2A live Round Robin demonstration
 

@@ -12,7 +12,7 @@
 
 ## Go unit testing
 
-Use the Go standard `testing` package for gateway packages. Phase 2B tests health-aware selection and probing. Phase 3A tests timeout configuration, timely/timed-out upstreams, 504 mapping, concurrent request handling, and existing error/path behavior. Phase 3B tests breaker defaults and config validation, consecutive failure threshold and reset, cooldown, HALF-OPEN admission limits, successful close, failed reopen, stale permits, cancellation, concurrent outcomes, backend isolation, Round Robin exclusion/re-entry, health-probe independence, and gateway-vs-application response classification. Phase 3C tests GET/HEAD-only retries, bounded attempts, backoff order/cancellation, replayable request bodies, alternate and single-backend selection, health/breaker admission, HALF-OPEN trials, application-status non-retry, body-stream non-retry, client-vs-gateway deadlines, retry-budget timeout, and permit completion. Phase 4A tests token consumption/refill, Retry-After rounding, per-IP separation and IPv4/IPv6 parsing, concurrent capacity, cleanup, environment validation, disabled behavior, health exemption, spoofed forwarding headers, and rejection before routing. Phase 5B tests final HTTP status/duration capture, bounded method/route labels, preserved streaming/flush behavior, one HTTP metric per request despite retries, backend and breaker state initialization/transitions, retry and security/rate-limit metrics, store failures distinct from quota 429, observer concurrency, label sensitivity, and metrics listener isolation/lifecycle. Existing 401, 403, 404, 429, 502, 503, 504, and path/query tests provide regression coverage. JWT/OAuth, distributed quotas, adaptive scoring, and EWMA remain unimplemented.
+Use the Go standard `testing` package for gateway packages. Phase 2B tests health-aware selection and probing. Phase 3A tests timeout configuration, timely/timed-out upstreams, 504 mapping, concurrent request handling, and existing error/path behavior. Phase 3B tests breaker defaults and config validation, consecutive failure threshold and reset, cooldown, HALF-OPEN admission limits, successful close, failed reopen, stale permits, cancellation, concurrent outcomes, backend isolation, Round Robin exclusion/re-entry, health-probe independence, and gateway-vs-application response classification. Phase 3C tests GET/HEAD-only retries, bounded attempts, backoff order/cancellation, replayable request bodies, alternate and single-backend selection, health/breaker admission, HALF-OPEN trials, application-status non-retry, body-stream non-retry, client-vs-gateway deadlines, retry-budget timeout, and permit completion. Phase 4A tests token consumption/refill, Retry-After rounding, per-IP separation and IPv4/IPv6 parsing, concurrent capacity, cleanup, environment validation, disabled behavior, health exemption, spoofed forwarding headers, and rejection before routing. Phase 5B tests final HTTP status/duration capture, bounded method/route labels, preserved streaming/flush behavior, one HTTP metric per request despite retries, backend and breaker state initialization/transitions, retry and security/rate-limit metrics, store failures distinct from quota 429, observer concurrency, label sensitivity, and metrics listener isolation/lifecycle. Phase 6 tests adaptive scoring, EWMA samples, cold-start exploration, cooldown ranking, deterministic injected-clock behavior, retry ordering, and proxy measurement lifecycle. Existing 401, 403, 404, 429, 502, 503, 504, and path/query tests provide regression coverage. JWT/OAuth and distributed quotas remain unimplemented.
 
 ## FastAPI testing with Pytest
 
@@ -293,7 +293,7 @@ The Redis bucket uses a SHA-256 digest of the canonical IP as its key suffix, se
 
 ## Load-balancing testing
 
-For Phase 2A/2B/3B routing, validate sequential selection, wraparound, distribution among healthy breaker-admitted instances, concurrency safety, exclusion after health failure or breaker open, half-open recovery re-entry, all-ineligible 503, and 502/504 for attempted upstream failures. Probe failures—not application response codes—change health; breaker outcomes come from upstream transport/body events, not application status codes. For future Adaptive Least-Loaded routing, validate scoring with controlled load/latency inputs, deterministic ties, and changes as signals update.
+For Phase 2A/2B/3B routing, validate sequential selection, wraparound, distribution among healthy breaker-admitted instances, concurrency safety, exclusion after health failure or breaker open, half-open recovery re-entry, all-ineligible 503, and 502/504 for attempted upstream failures. Phase 6 adaptive tests validate EWMA-based load scoring, exploration, cooldowns, deterministic ties, clock behavior, and measured-attempt lifecycle. Probe failures—not application response codes—change health; breaker outcomes come from upstream transport/body events, not application status codes.
 
 ## Circuit breaker and retry testing (implemented in Phases 3B and 3C)
 
@@ -317,9 +317,113 @@ go test -count=10 ./cmd/gateway
 go test -count=10 ./internal/auth
 ```
 
-## Performance testing
+## Performance testing (Phase 8)
 
-Use Locust for repeatable load generation. Record workload shape, duration, warm-up, concurrency, service configuration, and routing policy. Measure throughput, average/p50/p95/p99 latency, error rate, backend distribution, rate-limit behavior, and recovery time as described in [EXPERIMENTS.md](./EXPERIMENTS.md). Performance results are pending until real experiments are run.
+The `load-tests/` directory contains an equal-weight Locust workload for `GET /api/v1/products`, `GET /api/v1/orders`, and `GET /api/v1/users`, a PowerShell runner, and a dependency-free comparison script. The API key is read from `INTELLIGATE_BENCHMARK_API_KEY`; it is not stored in source or result metadata. The runner checks that Locust is installed before creating a run, verifies the active strategy gauge, performs a separate warm-up run, records the measured Locust CSVs, saves operator-declared gateway configuration, and captures backend selection, health, breaker, EWMA, in-flight, successful-sample, and rate-limit rejection metrics before and after measurement. A run is marked complete only after its outputs and metadata pass validation; a failure retains a `failed` metadata record and any partial artifacts.
+
+### Install and prepare
+
+From the repository root, start the three FastAPI services, Prometheus/Grafana, and the gateway as described above. Prometheus must scrape the gateway metrics listener. Use identical backend URL lists and all other gateway settings for both scenarios; only change the routing strategy. Set the same API key in the gateway and Locust terminal sessions. These prompts avoid putting a key literal in shell history:
+
+```powershell
+py -3 -m venv load-tests\.venv
+.\load-tests\.venv\Scripts\Activate.ps1
+python -m pip install -r load-tests\requirements.txt
+$env:INTELLIGATE_BENCHMARK_API_KEY = Read-Host "API key configured in the gateway"
+```
+
+For a meaningful backend distribution comparison, run one additional instance of each service on ports `8011`, `8012`, and `8013`. From the repository root, start these in separate service terminals:
+
+```powershell
+& .\services\product-service\.venv\Scripts\python.exe -m uvicorn main:app --app-dir .\services\product-service --host 127.0.0.1 --port 8011
+& .\services\order-service\.venv\Scripts\python.exe -m uvicorn main:app --app-dir .\services\order-service --host 127.0.0.1 --port 8012
+& .\services\user-service\.venv\Scripts\python.exe -m uvicorn main:app --app-dir .\services\user-service --host 127.0.0.1 --port 8013
+```
+
+In the gateway PowerShell session, set the same API key and backend lists for both runs. Keep authentication enabled and explicitly set an identical benchmark-only limiter configuration of 1,000 tokens/second with a 1,000-token burst. The limiter stays enabled; these values are within the Redis fixed-point range and are intentionally high relative to this 20-user workload. They do not change the gateway defaults (10/second, burst 20). The remaining values below state the retry, timeout, and breaker settings that the runner records; retries are fixed in code, while timeout and breaker settings are configurable:
+
+```powershell
+$secureKey = Read-Host "API key for gateway" -AsSecureString
+$env:INTELLIGATE_API_KEYS = [System.Net.NetworkCredential]::new("", $secureKey).Password
+$env:PRODUCT_SERVICE_URLS = "http://localhost:8001,http://localhost:8011"
+$env:ORDER_SERVICE_URLS = "http://localhost:8002,http://localhost:8012"
+$env:USER_SERVICE_URLS = "http://localhost:8003,http://localhost:8013"
+$env:INTELLIGATE_RATE_LIMIT_ENABLED = "true"
+$env:INTELLIGATE_RATE_LIMIT_RATE = "1000"
+$env:INTELLIGATE_RATE_LIMIT_BURST = "1000"
+$env:INTELLIGATE_RATE_LIMIT_STORE = "memory"
+$env:INTELLIGATE_REDIS_ADDR = "localhost:6379"
+$env:INTELLIGATE_REDIS_DB = "0"
+$env:INTELLIGATE_RATE_LIMIT_REDIS_FAILURE_MODE = "closed"
+$env:INTELLIGATE_UPSTREAM_TIMEOUT = "5s"
+$env:INTELLIGATE_CIRCUIT_BREAKER_FAILURE_THRESHOLD = "5"
+$env:INTELLIGATE_CIRCUIT_BREAKER_OPEN_COOLDOWN = "10s"
+$env:INTELLIGATE_CIRCUIT_BREAKER_HALF_OPEN_MAX_REQUESTS = "1"
+$env:INTELLIGATE_CIRCUIT_BREAKER_HALF_OPEN_SUCCESS_THRESHOLD = "1"
+$env:INTELLIGATE_ROUTING_STRATEGY = "round_robin"
+Set-Location gateway
+go run .\cmd\gateway
+```
+
+Keep the gateway process running. In the Locust PowerShell session (with the virtual environment active), securely set the same key and declare the exact same backend URL lists and relevant gateway configuration. These values are written into metadata but the key itself is not:
+
+```powershell
+$secureKey = Read-Host "API key for Locust" -AsSecureString
+$env:INTELLIGATE_BENCHMARK_API_KEY = [System.Net.NetworkCredential]::new("", $secureKey).Password
+$productUrls = "http://localhost:8001,http://localhost:8011"
+$orderUrls = "http://localhost:8002,http://localhost:8012"
+$userUrls = "http://localhost:8003,http://localhost:8013"
+$repositoryRoot = git rev-parse --show-toplevel
+Set-Location $repositoryRoot
+$common = @{
+    ProductBackendUrls = $productUrls
+    OrderBackendUrls = $orderUrls
+    UserBackendUrls = $userUrls
+    Users = 20
+    SpawnRate = 5
+    WarmupSeconds = 30
+    Duration = "5m"
+    RateLimitRate = 1000
+    RateLimitBurst = 1000
+    RateLimitStore = "memory"
+    RateLimitRedisAddress = "localhost:6379"
+    RateLimitRedisDB = 0
+    RateLimitFailureMode = "closed"
+    UpstreamTimeout = "5s"
+    BreakerFailureThreshold = 5
+    BreakerOpenCooldown = "10s"
+    BreakerHalfOpenMaxRequests = 1
+    BreakerHalfOpenSuccessThreshold = 1
+}
+.\load-tests\run_benchmark.ps1 -Strategy round_robin @common
+```
+
+Stop the gateway with Ctrl+C. In its PowerShell session, change only the strategy and restart it:
+
+```powershell
+$env:INTELLIGATE_ROUTING_STRATEGY = "adaptive"
+go run .\cmd\gateway
+```
+
+Run Adaptive with the exact same parameters, changing only the strategy:
+
+```powershell
+.\load-tests\run_benchmark.ps1 -Strategy adaptive @common
+```
+
+`Users`, `SpawnRate`, `WarmupSeconds`, and `Duration` are configurable; both runs must use matching values. The separate 30-second warm-up uses the same user count and spawn rate, but has no measured CSV output. The measured run starts with fresh Locust clients, so the warm-up exercises the gateway/backends and allows adaptive exploration before measurement, but does not preserve client connections. The runner requires the warm-up to allow the complete user ramp plus two seconds. It writes a unique directory under `benchmark-results\phase-8\` containing Locust CSVs, metadata, and Prometheus snapshots. Backend URL lists/counts and rate-limit (including Redis address/database but never its password), timeout, retry, breaker, Locust version, and workload fingerprints are recorded. Gateway settings are operator declarations mirrored from its startup environment because the gateway has no safe configuration-discovery endpoint; the runner checks the declared backend IDs/counts against health metrics, but health metrics alone cannot prove the actual URL lists match. The comparison rejects differences in declared configuration, code/workload fingerprints, workload, addresses, warm-up, or health.
+
+Run Adaptive after restarting the gateway with only `INTELLIGATE_ROUTING_STRATEGY` changed. Compare the latest run directories after reviewing their names:
+
+```powershell
+$roundRobinRun = Get-ChildItem .\benchmark-results\phase-8\round_robin-* -Directory | Sort-Object Name | Select-Object -Last 1
+$adaptiveRun = Get-ChildItem .\benchmark-results\phase-8\adaptive-* -Directory | Sort-Object Name | Select-Object -Last 1
+python .\load-tests\compare_results.py --round-robin $roundRobinRun.FullName --adaptive $adaptiveRun.FullName
+```
+
+The comparison writes timestamped JSON and Markdown reports under `benchmark-results\phase-8\`. It validates required Locust CSVs, completed metadata, configuration equality, health, gateway process stability, and non-resetting Prometheus counters before reporting throughput, average, median, P95/P99 latency, failure rate, selection deltas, and rate-limit rejection deltas. Locust counts HTTP 429 responses as failures. The runner records `exhausted` quota rejections separately; runs with 429s are limiter-constrained and should not be presented as an unconstrained routing-performance result. Do not disable the limiter to remove failures. The example's 1000/1000 setting remains enabled and is only for the benchmark gateway process; it does not change production defaults. Locust latency is end-to-end through the gateway, not upstream TTFB. Snapshot deltas bracket the measured run and can include completion of requests already in flight at the measurement boundary; Prometheus scrape cadence also limits timing precision.
+
+See [EXPERIMENTS.md](./EXPERIMENTS.md) for metric definitions and interpretation notes. Generated benchmark files remain ignored by Git.
 
 ## Failure and recovery testing
 
@@ -327,4 +431,4 @@ Inject controlled backend failure, latency, and restart/recovery events in a loc
 
 ## Current status
 
-Phase 1 service tests and Phase 2A/2B/3A/3B/3C/4A/4B.1/4B.2/5A Go routing, health-check, timeout, circuit-breaker, retry, memory/Redis rate-limit, API-key authentication, RBAC, and integration tests are implemented. Record manual verification results in [DEVELOPMENT_LOG.md](./DEVELOPMENT_LOG.md) only after running them. Tests for JWT/OAuth, distributed authentication, databases, and adaptive routing are not implemented.
+Phase 1 service tests and Phase 2A/2B/3A/3B/3C/4A/4B.1/4B.2/5A/6 Go routing, adaptive routing, health-check, timeout, circuit-breaker, retry, memory/Redis rate-limit, API-key authentication, RBAC, and integration tests are implemented. Phase 8 adds repeatable Locust workloads; performance measurements remain pending until benchmark runs are completed and recorded. Tests for JWT/OAuth, distributed authentication, and persistent database integration are not implemented.

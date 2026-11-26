@@ -43,9 +43,9 @@ Microservice applications need a consistent entry point to authenticate clients,
 | Prometheus metrics and Grafana overview dashboard | Implemented in Phase 5B |
 | Traffic anomaly detection using Python and scikit-learn | Planned |
 | Product, Order, and User FastAPI services | Implemented in Phase 1 |
-| React + TypeScript dashboard | Planned |
-| Docker Compose demonstration environment | Planned |
-| Locust performance experiments | Planned |
+| React monitoring dashboard | Implemented in Phase 7 |
+| Docker Compose demonstration environment | Monitoring stack implemented; application services remain native |
+| Locust performance experiments | Implemented in Phase 8; measurements pending |
 
 ## Architecture
 
@@ -78,6 +78,10 @@ Breakers are per instance: after 5 qualifying transport failures, an instance is
 
 The stack is fixed for this project; any proposed change requires technical justification and explicit approval.
 
+## Load testing
+
+Phase 8 adds an authenticated Locust workload for equal-weight Product, Order, and User GET requests, a PowerShell runner with a separate excluded warm-up, and a comparison script that validates recorded workload and gateway configuration before comparing Round Robin and Adaptive results. See [TESTING.md](./TESTING.md) for exact PowerShell commands and [EXPERIMENTS.md](./EXPERIMENTS.md) for interpretation. The runner stores operator-declared backend URL lists/counts and rate-limit, retry, timeout, and breaker settings without storing credentials. Backend health metrics can confirm instance IDs and health, but cannot prove URL lists match the running gateway; verify those against the gateway startup environment. Benchmark output is written under the ignored `benchmark-results/` directory. Performance results remain pending; no advantage is claimed without completed live measurements. The production default rate limit remains 10 requests/second per client IP with a burst of 20. The documented routing benchmark uses an explicit benchmark-only 1000/1000 setting while keeping rate limiting enabled; HTTP 429 responses remain failures and indicate a limiter-constrained run.
+
 ## Project structure
 
 ```text
@@ -86,7 +90,7 @@ IntelliGate/
 │   ├── go.mod
 │   ├── cmd/gateway/main.go
 │   └── internal/
-│       ├── balancer/   # Round Robin
+│       ├── balancer/   # Round Robin and adaptive routing
 │       ├── auth/       # API keys and role-based access control
 │       ├── proxy/      # implemented
 │       ├── router/     # implemented
@@ -135,10 +139,12 @@ The `observability/` Compose stack runs only Prometheus and Grafana; the gateway
 | 5A | Add optional Redis-backed shared token-bucket rate limiting | Implemented; tests included |
 | 5B | Add Prometheus metrics and provisioned Grafana monitoring | Implemented; tests included |
 | 6 | Add opt-in adaptive EWMA/load-aware backend routing | Implemented; tests included |
+| 7 | Build a React gateway monitoring dashboard | Implemented |
+| 8 | Add repeatable Locust load tests and benchmark comparison tooling | Implemented; live results pending |
 | Later | Add JWT/OAuth and distributed authentication | Pending |
-| Later | Add dashboard, anomaly detection, load experiments, and deployment automation | Pending |
+| Later | Add anomaly detection and deployment automation | Pending |
 
-Phase 1, Phase 2A, Phase 2B, Phase 3A, Phase 3B, Phase 3C, Phase 4A, Phase 4B.1, Phase 4B.2, Phase 5A, Phase 5B, and Phase 6 implementations are recorded below. Later-phase work remains pending.
+Phase 1 through Phase 8 implementations are recorded below. Live Phase 8 performance results remain pending; other later-phase work remains pending.
 
 ## Run locally
 
