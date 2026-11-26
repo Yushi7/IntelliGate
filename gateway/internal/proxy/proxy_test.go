@@ -508,6 +508,21 @@ func TestTransportFailureRecordedWithoutBreakerPermit(t *testing.T) {
 	}
 }
 
+func TestZeroDurationSuccessfulTTFBUsesPositiveAvailableSample(t *testing.T) {
+	outcome := &attemptOutcome{}
+	recordTTFB(outcome, 0)
+
+	outcome.mu.Lock()
+	ttfb, available := outcome.ttfb, outcome.ttfbAvailable
+	outcome.mu.Unlock()
+	if !available {
+		t.Fatal("zero-duration successful response TTFB was marked unavailable")
+	}
+	if ttfb != time.Nanosecond {
+		t.Fatalf("normalized TTFB = %s, want minimum positive duration %s", ttfb, time.Nanosecond)
+	}
+}
+
 func TestMeasuredAttemptReportsTTFBAndCompletedBody(t *testing.T) {
 	b, err := NewBackend("http://backend.test")
 	if err != nil {

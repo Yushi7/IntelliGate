@@ -164,10 +164,7 @@ func (t breakerAwareTransport) RoundTrip(req *http.Request) (*http.Response, err
 	response, err := t.next.RoundTrip(req)
 	outcome := attemptOutcomeFrom(req.Context())
 	if outcome != nil && err == nil && response != nil {
-		outcome.mu.Lock()
-		outcome.ttfb = time.Since(started)
-		outcome.ttfbAvailable = outcome.ttfb > 0
-		outcome.mu.Unlock()
+		recordTTFB(outcome, time.Since(started))
 	}
 	permit := circuitbreaker.PermitFromContext(req.Context())
 	if err != nil && outcome != nil && !IsClientContextDone(req.Context()) {
@@ -209,6 +206,18 @@ func (t breakerAwareTransport) RoundTrip(req *http.Request) (*http.Response, err
 		outcome:    outcome,
 	}
 	return response, nil
+}
+
+func recordTTFB(outcome *attemptOutcome, measured time.Duration) {
+	if measured <= 0 {
+		// The monotonic clock can return the same tick for an in-process response.
+		// Preserve availability and use its smallest positive representable duration.
+		measured = time.Nanosecond
+	}
+	outcome.mu.Lock()
+	outcome.ttfb = measured
+	outcome.ttfbAvailable = true
+	outcome.mu.Unlock()
 }
 
 type observedResponseBody struct {
