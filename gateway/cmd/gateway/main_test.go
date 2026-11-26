@@ -503,6 +503,10 @@ func TestRoutingConfigFromEnvDefaultsAndAcceptsAdaptiveOverrides(t *testing.T) {
 	if config != want {
 		t.Fatalf("adaptive routing config = %+v, want %+v", config, want)
 	}
+	metrics := observability.New(time.Second)
+	metrics.SetRoutingStrategy(string(config.Strategy))
+	assertMetricValue(t, metrics, "intelligate_routing_strategy_info", map[string]string{"strategy": "adaptive"}, 1)
+	assertMetricValue(t, metrics, "intelligate_routing_strategy_info", map[string]string{"strategy": "round_robin"}, 0)
 }
 
 func TestRoutingConfigFromEnvRejectsInvalidValues(t *testing.T) {

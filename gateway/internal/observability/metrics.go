@@ -30,6 +30,7 @@ type Metrics struct {
 	backendEWMALatency           *prometheus.GaugeVec
 	backendInFlight              *prometheus.GaugeVec
 	backendSuccessfulSamples     *prometheus.CounterVec
+	routingStrategy              *prometheus.GaugeVec
 	backendHealthMu              sync.Mutex
 	backendHealthVersion         map[string]uint64
 	backendPerformanceMu         sync.Mutex
@@ -103,6 +104,10 @@ func New(upstreamTimeout time.Duration) *Metrics {
 			Name: "intelligate_backend_successful_samples_total",
 			Help: "Successful backend latency samples observed by this gateway process.",
 		}, []string{"service", "backend_id"}),
+		routingStrategy: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "intelligate_routing_strategy_info",
+			Help: "One-hot indicator for the active gateway routing strategy.",
+		}, []string{"strategy"}),
 		backendHealthVersion:         make(map[string]uint64),
 		backendPerformanceGeneration: make(map[string]uint64),
 		breakerStateGeneration:       make(map[string]uint64),
@@ -126,7 +131,11 @@ func New(upstreamTimeout time.Duration) *Metrics {
 		metrics.backendEWMALatency,
 		metrics.backendInFlight,
 		metrics.backendSuccessfulSamples,
+		metrics.routingStrategy,
 	)
+	for _, strategy := range []string{"round_robin", "adaptive"} {
+		metrics.routingStrategy.WithLabelValues(strategy).Set(0)
+	}
 	return metrics
 }
 
@@ -141,6 +150,20 @@ func durationBuckets(upstreamTimeout time.Duration) []float64 {
 
 func (m *Metrics) Registry() *prometheus.Registry {
 	return m.registry
+}
+
+// SetRoutingStrategy publishes only the supported, non-sensitive routing mode.
+func (m *Metrics) SetRoutingStrategy(strategy string) {
+	if strategy != "round_robin" && strategy != "adaptive" {
+		return
+	}
+	for _, candidate := range []string{"round_robin", "adaptive"} {
+		value := 0.0
+		if candidate == strategy {
+			value = 1
+		}
+		m.routingStrategy.WithLabelValues(candidate).Set(value)
+	}
 }
 
 func (m *Metrics) Handler() http.Handler {

@@ -103,6 +103,7 @@ func runGateway() error {
 	if err != nil {
 		return err
 	}
+	metrics.SetRoutingStrategy(string(routingConfig.Strategy))
 
 	products, productBackends, err := newServiceProxyWithRouting("PRODUCT_SERVICE_URLS", "products", "http://localhost:8001", upstreamTimeout, breakerConfig, routingConfig, metrics)
 	if err != nil {

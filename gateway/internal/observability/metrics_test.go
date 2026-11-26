@@ -61,6 +61,7 @@ func TestMetricsRegisterExpectedFamilies(t *testing.T) {
 		"intelligate_backend_ewma_latency_seconds",
 		"intelligate_backend_in_flight_requests",
 		"intelligate_backend_successful_samples_total",
+		"intelligate_routing_strategy_info",
 		"go_goroutines",
 	} {
 		if !found[name] {
@@ -69,6 +70,28 @@ func TestMetricsRegisterExpectedFamilies(t *testing.T) {
 	}
 	if metrics.Registry() == prometheus.DefaultRegisterer {
 		t.Fatal("metrics registry unexpectedly uses Prometheus's global default registry")
+	}
+}
+
+func TestRoutingStrategyMetricIsOneHotAndRejectsUnknownValues(t *testing.T) {
+	metrics := observability.New(time.Second)
+	metrics.SetRoutingStrategy("adaptive")
+	if got := gaugeValue(t, metrics.Registry(), "intelligate_routing_strategy_info", map[string]string{"strategy": "adaptive"}); got != 1 {
+		t.Fatalf("adaptive strategy metric = %v, want 1", got)
+	}
+	if got := gaugeValue(t, metrics.Registry(), "intelligate_routing_strategy_info", map[string]string{"strategy": "round_robin"}); got != 0 {
+		t.Fatalf("round robin strategy metric = %v, want 0", got)
+	}
+	metrics.SetRoutingStrategy("invalid")
+	if got := gaugeValue(t, metrics.Registry(), "intelligate_routing_strategy_info", map[string]string{"strategy": "adaptive"}); got != 1 {
+		t.Fatalf("unknown strategy changed active metric to %v, want 1", got)
+	}
+	metrics.SetRoutingStrategy("round_robin")
+	if got := gaugeValue(t, metrics.Registry(), "intelligate_routing_strategy_info", map[string]string{"strategy": "round_robin"}); got != 1 {
+		t.Fatalf("round robin strategy metric after update = %v, want 1", got)
+	}
+	if got := gaugeValue(t, metrics.Registry(), "intelligate_routing_strategy_info", map[string]string{"strategy": "adaptive"}); got != 0 {
+		t.Fatalf("adaptive strategy metric after update = %v, want 0", got)
 	}
 }
 
