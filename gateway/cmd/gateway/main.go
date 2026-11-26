@@ -46,6 +46,9 @@ const (
 	breakerOpenCooldownEnv             = "INTELLIGATE_CIRCUIT_BREAKER_OPEN_COOLDOWN"
 	breakerHalfOpenMaxRequestsEnv      = "INTELLIGATE_CIRCUIT_BREAKER_HALF_OPEN_MAX_REQUESTS"
 	breakerHalfOpenSuccessThresholdEnv = "INTELLIGATE_CIRCUIT_BREAKER_HALF_OPEN_SUCCESS_THRESHOLD"
+	routingStrategyEnv                 = "INTELLIGATE_ROUTING_STRATEGY"
+	adaptiveEWMAAlphaEnv               = "INTELLIGATE_ADAPTIVE_EWMA_ALPHA"
+	adaptiveMinSamplesEnv              = "INTELLIGATE_ADAPTIVE_MIN_SAMPLES"
 )
 
 func main() {
@@ -96,16 +99,20 @@ func runGateway() error {
 	if err != nil {
 		return err
 	}
+	routingConfig, err := routingConfigFromEnv()
+	if err != nil {
+		return err
+	}
 
-	products, productBackends, err := newServiceProxyWithMetrics("PRODUCT_SERVICE_URLS", "products", "http://localhost:8001", upstreamTimeout, breakerConfig, metrics)
+	products, productBackends, err := newServiceProxyWithRouting("PRODUCT_SERVICE_URLS", "products", "http://localhost:8001", upstreamTimeout, breakerConfig, routingConfig, metrics)
 	if err != nil {
 		return err
 	}
-	orders, orderBackends, err := newServiceProxyWithMetrics("ORDER_SERVICE_URLS", "orders", "http://localhost:8002", upstreamTimeout, breakerConfig, metrics)
+	orders, orderBackends, err := newServiceProxyWithRouting("ORDER_SERVICE_URLS", "orders", "http://localhost:8002", upstreamTimeout, breakerConfig, routingConfig, metrics)
 	if err != nil {
 		return err
 	}
-	users, userBackends, err := newServiceProxyWithMetrics("USER_SERVICE_URLS", "users", "http://localhost:8003", upstreamTimeout, breakerConfig, metrics)
+	users, userBackends, err := newServiceProxyWithRouting("USER_SERVICE_URLS", "users", "http://localhost:8003", upstreamTimeout, breakerConfig, routingConfig, metrics)
 	if err != nil {
 		return err
 	}
@@ -279,6 +286,16 @@ func newServiceProxyWithMetrics(
 	breakerConfig circuitbreaker.Config,
 	metrics *observability.Metrics,
 ) (*balancer.RoundRobin, []health.Backend, error) {
+	return newServiceProxyWithRouting(envName, service, defaultURL, upstreamTimeout, breakerConfig, balancer.DefaultRoutingConfig(), metrics)
+}
+
+func newServiceProxyWithRouting(
+	envName, service, defaultURL string,
+	upstreamTimeout time.Duration,
+	breakerConfig circuitbreaker.Config,
+	routingConfig balancer.RoutingConfig,
+	metrics *observability.Metrics,
+) (*balancer.RoundRobin, []health.Backend, error) {
 	urls, err := backendURLsFromEnv(envName, defaultURL)
 	if err != nil {
 		return nil, nil, err
@@ -310,8 +327,9 @@ func newServiceProxyWithMetrics(
 		breakers = append(breakers, breaker)
 	}
 
-	selector, err := balancer.NewRoundRobinWithRetryPolicy(
+	selector, err := balancer.NewRoundRobinWithConfig(
 		balancer.DefaultRetryPolicy(upstreamTimeout),
+		routingConfig,
 		backends...,
 	)
 	if err != nil {
@@ -373,6 +391,43 @@ func (o *serviceBalancerObserver) RetryAttempt(method string) {
 
 func (o *serviceBalancerObserver) RetryOutcome(outcome string) {
 	o.metrics.RecordRetryOutcome(o.service, outcome)
+}
+
+func (o *serviceBalancerObserver) BackendPerformance(index int, ewma time.Duration, inFlight uint64, sampleAdded bool, generation uint64) {
+	if index >= 0 && index < len(o.backendIDs) {
+		o.metrics.SetBackendPerformance(o.service, o.backendIDs[index], ewma, inFlight, sampleAdded, generation)
+	}
+}
+
+func routingConfigFromEnv() (balancer.RoutingConfig, error) {
+	config := balancer.DefaultRoutingConfig()
+	if value, configured := os.LookupEnv(routingStrategyEnv); configured {
+		config.Strategy = balancer.RoutingStrategy(value)
+	}
+	if value, configured := os.LookupEnv(adaptiveEWMAAlphaEnv); configured {
+		alpha, err := strconv.ParseFloat(value, 64)
+		if err != nil || math.IsNaN(alpha) || math.IsInf(alpha, 0) || alpha <= 0 || alpha > 1 {
+			return balancer.RoutingConfig{}, fmt.Errorf("%s must be a number greater than 0 and at most 1", adaptiveEWMAAlphaEnv)
+		}
+		config.EWMAAlpha = alpha
+	}
+	if value, configured := os.LookupEnv(adaptiveMinSamplesEnv); configured {
+		samples, err := strconv.ParseUint(value, 10, 64)
+		if err != nil || samples == 0 {
+			return balancer.RoutingConfig{}, fmt.Errorf("%s must be a positive integer", adaptiveMinSamplesEnv)
+		}
+		config.MinSamples = samples
+	}
+	if config.Strategy != balancer.StrategyRoundRobin && config.Strategy != balancer.StrategyAdaptive {
+		return balancer.RoutingConfig{}, fmt.Errorf("%s must be round_robin or adaptive", routingStrategyEnv)
+	}
+	if config.EWMAAlpha <= 0 || config.EWMAAlpha > 1 {
+		return balancer.RoutingConfig{}, fmt.Errorf("%s must be greater than 0 and at most 1", adaptiveEWMAAlphaEnv)
+	}
+	if config.MinSamples == 0 {
+		return balancer.RoutingConfig{}, fmt.Errorf("%s must be a positive integer", adaptiveMinSamplesEnv)
+	}
+	return config, nil
 }
 
 func metricBreakerState(state circuitbreaker.State) string {

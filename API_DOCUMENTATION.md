@@ -1,6 +1,6 @@
 # API Documentation
 
-**Status:** Phase 1 implements the service `GET /`, `GET /health`, sample collection GET endpoints, gateway proxy routing, and gateway `GET /health`. Phase 2A adds round-robin distribution; Phase 2B restricts selection to backends whose direct `/health` probe returned 2xx; Phase 3A adds configurable upstream request timeouts; Phase 3B adds per-backend circuit breakers; Phase 3C adds bounded retries for eligible GET/HEAD transport failures; Phase 4A adds in-memory per-client-IP token-bucket rate limiting; Phase 4B.1 adds API-key authentication; Phase 4B.2 adds role-based access control; Phase 5A adds optional Redis-backed shared token-bucket storage; Phase 5B adds Prometheus metrics on a separate listener and a provisioned Grafana dashboard.
+**Status:** Phase 1 implements the service `GET /`, `GET /health`, sample collection GET endpoints, gateway proxy routing, and gateway `GET /health`. Phase 2A adds round-robin distribution; Phase 2B restricts selection to backends whose direct `/health` probe returned 2xx; Phase 3A adds configurable upstream request timeouts; Phase 3B adds per-backend circuit breakers; Phase 3C adds bounded retries for eligible GET/HEAD transport failures; Phase 4A adds in-memory per-client-IP token-bucket rate limiting; Phase 4B.1 adds API-key authentication; Phase 4B.2 adds role-based access control; Phase 5A adds optional Redis-backed shared token-bucket storage; Phase 5B adds Prometheus metrics on a separate listener and a provisioned Grafana dashboard; Phase 6 adds opt-in adaptive routing with upstream TTFB EWMA, in-flight tracking, and failure cooldowns.
 
 ## Conventions
 
@@ -9,7 +9,7 @@
 - The gateway listens on port `8080`; single-instance defaults are Product `8001`, Order `8002`, and User `8003`.
 - The metrics listener defaults to port `9091` and serves `/metrics`; `INTELLIGATE_METRICS_LISTEN_ADDR` configures its host:port independently of the API listener.
 - Optional multiple instances are configured with comma-separated full URLs in `PRODUCT_SERVICE_URLS`, `ORDER_SERVICE_URLS`, and `USER_SERVICE_URLS`. No additional port assignment is mandated.
-- The gateway probes each backend directly with `GET /health` every 5 seconds and a 2-second timeout. Redirects are not followed. Each service request goes to the next healthy configured instance.
+- The gateway probes each backend directly with `GET /health` every 5 seconds and a 2-second timeout. Redirects are not followed. Requests use health- and breaker-eligible instances selected by the configured routing strategy.
 - API-key authentication is enabled by default. Configure either `INTELLIGATE_API_KEY_ROLES` as a JSON key-to-role object, or legacy comma-separated `INTELLIGATE_API_KEYS`; setting both is rejected. Legacy keys receive the `admin` role. `INTELLIGATE_AUTH_ENABLED=false` explicitly disables authentication.
 - Every `/api/v1` and `/api/v1/*` request requires one `X-API-Key` header. Missing, invalid, repeated, or invalid credentials return `401 Unauthorized` with `{"error":"unauthorized"}`. Authenticated requests without method permission return `403 Forbidden` with `{"error":"forbidden"}`.
 - Roles allow these methods: `admin` allows GET, HEAD, POST, PUT, PATCH, DELETE; `read` allows GET and HEAD; `write` allows GET, HEAD, POST, PUT, PATCH, DELETE. Unsupported methods, including OPTIONS, TRACE, and CONNECT, are denied.
@@ -33,10 +33,23 @@
 - The gateway preserves the full incoming path and query when proxying. It does not strip the `/api/v1/<service>` prefix.
 - Implemented service routes return sample data. Requests through the gateway require an API key with a role permitting the HTTP method; direct access to service ports bypasses gateway authentication. Do not treat these sample services as production APIs.
 - The user-order listing operation is owned by the Order Service, not the User Service. Although it may be expressed conceptually as `GET /api/v1/users/{user_id}/orders`, it is exposed at `GET /api/v1/orders/users/{user_id}` to follow the Order Service route namespace.
+
 - JSON examples are illustrative contract proposals, not observed responses.
 - Use `X-API-Key: <client-api-key>` for gateway API requests. Never commit a real key.
 - On the API listener, only gateway `GET /health` is public. The separate metrics listener is not API-authenticated; restrict its network access with firewall and network controls.
 - Error response schema, pagination, and exact field validation remain to be finalized.
+
+## Backend routing (implemented; adaptive option in Phase 6)
+
+Round Robin is the default. `INTELLIGATE_ROUTING_STRATEGY` accepts `round_robin` (default) or `adaptive`; other values fail startup. The setting applies consistently to Product, Order, and User backend pools. Both strategies admit only healthy backends whose circuit breaker permits a request. An open breaker or unavailable half-open trial slot excludes that backend.
+
+Adaptive routing uses successful upstream time-to-first-byte (TTFB) EWMA and current in-flight request count. Its score is `EWMA latency × (1 + in-flight requests)`. Until every eligible candidate in a retry pass has the minimum number of successful samples, the least-sampled candidate is explored. Equal sample counts and equal scores use deterministic Round Robin cursor order.
+
+Transport/body failures apply per-backend cooldowns: 5 seconds after the first consecutive failure, then 10 and 20 seconds, capped at 30 seconds. Within each retry pass, non-cooling eligible backends are preferred. If all eligible candidates are cooling down, the earliest-to-recover is preferred. A successful completed measured response resets the failure count and cooldown. Retries prefer eligible backends not already attempted before considering previously attempted ones, while still applying cooldown ranking within each group. GET and HEAD retry limits and backoff are described below.
+
+`INTELLIGATE_ADAPTIVE_EWMA_ALPHA` defaults to `0.2` and must be finite, greater than 0, and at most 1. `INTELLIGATE_ADAPTIVE_MIN_SAMPLES` defaults to `5` and must be a positive integer. Both are validated at startup, including when Round Robin is selected.
+
+TTFB is captured when upstream response headers arrive. It remains pending and is added to EWMA, with the successful-sample counter incremented, only after the response body completes successfully and a TTFB measurement is available. Response bodies remain streamed without full-response buffering. In-flight tracking continues until the complete backend attempt, including body streaming, finishes. Performance estimates are process-local and reset when the gateway restarts.
 
 ## Gateway operational endpoints
 
@@ -113,6 +126,11 @@ The dedicated registry exposes these IntelliGate metrics:
 | `intelligate_circuit_breaker_transitions_total` | Counter | `service`, `backend_id`, `from`, `to` |
 | `intelligate_upstream_retry_attempts_total` | Counter | `service`, `method` |
 | `intelligate_upstream_retry_outcomes_total` | Counter | `service`, `outcome` |
+| `intelligate_backend_ewma_latency_seconds` | Gauge | `service`, `backend_id` |
+| `intelligate_backend_in_flight_requests` | Gauge | `service`, `backend_id` |
+| `intelligate_backend_successful_samples_total` | Counter | `service`, `backend_id` |
+
+The adaptive EWMA gauge measures upstream TTFB, not downstream response delivery duration. A sample and successful-sample counter increment occur only after successful response-body completion. In-flight gauges cover the full attempt through body completion. These metric names and labels are present whether Round Robin or adaptive routing is selected; performance tracking remains enabled in either mode.
 
 Routes are normalized to `products`, `orders`, `users`, `health`, or `unmatched`; methods are known HTTP methods or `OTHER`. Backend IDs are stable service/index identifiers. Raw URL/path/query, IP, API key, role, and arbitrary error values are never metric labels. One HTTP request is counted once even when upstream retries occur. A Redis/store failure in closed mode returns 503 and increments `reason="store_unavailable"`, not the 429 quota-exhaustion series. The metrics do not provide alert rules or per-client/per-key breakdowns.
 
@@ -220,7 +238,7 @@ Administrative paths are provisional and must not be exposed publicly without an
 ### `PUT /admin/v1/routing-policy`
 
 - **Purpose:** Planned selection of a routing policy.
-- **Request:** Planned JSON, `{"policy":"round_robin"}` or `{"policy":"adaptive_least_loaded"}`.
+- **Request:** Planned JSON, `{"policy":"round_robin"}` or `{"policy":"adaptive"}`. This endpoint is not implemented; the active policy is selected at gateway startup with `INTELLIGATE_ROUTING_STRATEGY`.
 - **Expected response:** `200 OK`, for example `{"policy":"round_robin"}` after successful validation.
 - **Authentication:** Planned administrator-only authentication; mechanism TBD.
 

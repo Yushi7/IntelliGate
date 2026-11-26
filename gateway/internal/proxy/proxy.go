@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"intelligate/gateway/internal/circuitbreaker"
@@ -27,6 +29,14 @@ type Backend struct {
 type AttemptError struct {
 	StatusCode int
 	Err        error
+}
+
+type MeasuredAttemptResult struct {
+	Err              *AttemptError
+	BodyCompleted    bool
+	TTFB             time.Duration
+	TTFBAvailable    bool
+	TransportFailure bool
 }
 
 func (e *AttemptError) Error() string {
@@ -109,16 +119,35 @@ func (h *backendHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 }
 
 func (h *backendHandler) ServeAttempt(w http.ResponseWriter, req *http.Request) *AttemptError {
+	attemptError, _ := h.ServeAttemptResult(w, req)
+	return attemptError
+}
+
+func (h *backendHandler) ServeAttemptResult(w http.ResponseWriter, req *http.Request) (*AttemptError, bool) {
+	result := h.ServeMeasuredAttemptResult(w, req)
+	return result.Err, result.BodyCompleted
+}
+
+func (h *backendHandler) ServeMeasuredAttemptResult(w http.ResponseWriter, req *http.Request) MeasuredAttemptResult {
 	outcome := &attemptOutcome{}
 	ctx := context.WithValue(req.Context(), attemptOutcomeKey{}, outcome)
 	h.ServeHTTP(w, req.WithContext(ctx))
-	return outcome.err
+	outcome.mu.Lock()
+	ttfb := outcome.ttfb
+	ttfbAvailable := outcome.ttfbAvailable
+	outcome.mu.Unlock()
+	return MeasuredAttemptResult{Err: outcome.err, BodyCompleted: outcome.successful.Load(), TTFB: ttfb, TTFBAvailable: ttfbAvailable, TransportFailure: outcome.failed.Load()}
 }
 
 type attemptOutcomeKey struct{}
 
 type attemptOutcome struct {
-	err *AttemptError
+	err           *AttemptError
+	successful    atomic.Bool
+	failed        atomic.Bool
+	mu            sync.Mutex
+	ttfb          time.Duration
+	ttfbAvailable bool
 }
 
 func attemptOutcomeFrom(ctx context.Context) *attemptOutcome {
@@ -131,9 +160,27 @@ type breakerAwareTransport struct {
 }
 
 func (t breakerAwareTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	started := time.Now()
 	response, err := t.next.RoundTrip(req)
+	outcome := attemptOutcomeFrom(req.Context())
+	if outcome != nil && err == nil && response != nil {
+		outcome.mu.Lock()
+		outcome.ttfb = time.Since(started)
+		outcome.ttfbAvailable = outcome.ttfb > 0
+		outcome.mu.Unlock()
+	}
 	permit := circuitbreaker.PermitFromContext(req.Context())
+	if err != nil && outcome != nil && !IsClientContextDone(req.Context()) {
+		outcome.failed.Store(true)
+	}
 	if permit == nil {
+		if outcome != nil {
+			if err == nil && (response == nil || response.Body == nil) {
+				outcome.successful.Store(true)
+			} else if err == nil && response != nil {
+				response.Body = observedResponseBody{ReadCloser: response.Body, ctx: req.Context(), outcome: outcome}
+			}
+		}
 		return response, err
 	}
 	if err != nil {
@@ -141,11 +188,17 @@ func (t breakerAwareTransport) RoundTrip(req *http.Request) (*http.Response, err
 			permit.Abandon()
 		} else {
 			permit.Failure()
+			if outcome != nil {
+				outcome.failed.Store(true)
+			}
 		}
 		return response, err
 	}
 	if response == nil || response.Body == nil {
 		permit.Success()
+		if outcome != nil {
+			outcome.successful.Store(true)
+		}
 		return response, nil
 	}
 
@@ -153,14 +206,16 @@ func (t breakerAwareTransport) RoundTrip(req *http.Request) (*http.Response, err
 		ReadCloser: response.Body,
 		permit:     permit,
 		ctx:        req.Context(),
+		outcome:    outcome,
 	}
 	return response, nil
 }
 
 type observedResponseBody struct {
 	io.ReadCloser
-	permit *circuitbreaker.Permit
-	ctx    context.Context
+	permit  *circuitbreaker.Permit
+	ctx     context.Context
+	outcome *attemptOutcome
 }
 
 func (b observedResponseBody) Read(buffer []byte) (int, error) {
@@ -169,22 +224,50 @@ func (b observedResponseBody) Read(buffer []byte) (int, error) {
 		return count, nil
 	}
 	if errors.Is(err, io.EOF) {
-		b.permit.Success()
+		if b.outcome != nil {
+			b.outcome.successful.Store(true)
+		}
+		if b.permit != nil {
+			b.permit.Success()
+		}
 	} else if IsClientContextDone(b.ctx) {
-		b.permit.Abandon()
+		if b.permit != nil {
+			b.permit.Abandon()
+		}
 	} else {
-		b.permit.Failure()
+		if b.outcome != nil {
+			b.outcome.failed.Store(true)
+		}
+		if b.permit != nil {
+			b.permit.Failure()
+		}
+	}
+	if err != nil && !errors.Is(err, io.EOF) && b.outcome != nil {
+		b.outcome.successful.Store(false)
+		if !IsClientContextDone(b.ctx) {
+			b.outcome.failed.Store(true)
+		}
 	}
 	return count, err
 }
 
 func (b observedResponseBody) Close() error {
+	completed := b.outcome != nil && b.outcome.successful.Load()
 	err := b.ReadCloser.Close()
+	if !completed && b.outcome != nil {
+		b.outcome.successful.Store(false)
+		if !IsClientContextDone(b.ctx) && (isGatewayTimeoutContext(b.ctx) || err != nil) {
+			b.outcome.failed.Store(true)
+		}
+	}
+	if b.permit == nil {
+		return err
+	}
 	if IsClientContextDone(b.ctx) {
 		b.permit.Abandon()
-	} else if isGatewayTimeoutContext(b.ctx) || err != nil {
+	} else if !completed && (isGatewayTimeoutContext(b.ctx) || err != nil) {
 		b.permit.Failure()
-	} else {
+	} else if !completed {
 		b.permit.Abandon()
 	}
 	return err

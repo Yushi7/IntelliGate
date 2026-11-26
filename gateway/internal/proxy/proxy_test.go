@@ -71,7 +71,7 @@ func TestProxyTimesOutSlowUpstreamWithoutBlockingConcurrentRequest(t *testing.T)
 	}))
 	defer backend.Close()
 
-	handler, err := NewWithTimeout(backend.URL, timeout)
+	proxyBackend, err := NewBackendWithTimeout(backend.URL, timeout)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -79,7 +79,7 @@ func TestProxyTimesOutSlowUpstreamWithoutBlockingConcurrentRequest(t *testing.T)
 	slowResponse := httptest.NewRecorder()
 	slowDone := make(chan struct{})
 	go func() {
-		handler.ServeHTTP(slowResponse, httptest.NewRequest(http.MethodGet, "/slow", nil))
+		proxyBackend.Handler.ServeHTTP(slowResponse, httptest.NewRequest(http.MethodGet, "/slow", nil))
 		close(slowDone)
 	}()
 	select {
@@ -91,7 +91,7 @@ func TestProxyTimesOutSlowUpstreamWithoutBlockingConcurrentRequest(t *testing.T)
 	fastResponse := httptest.NewRecorder()
 	fastDone := make(chan struct{})
 	go func() {
-		handler.ServeHTTP(fastResponse, httptest.NewRequest(http.MethodGet, "/fast", nil))
+		proxyBackend.Handler.ServeHTTP(fastResponse, httptest.NewRequest(http.MethodGet, "/fast", nil))
 		close(fastDone)
 	}()
 	select {
@@ -140,7 +140,7 @@ func TestApplicationStatusesDoNotCountAsCircuitBreakerFailures(t *testing.T) {
 	}))
 	defer backend.Close()
 
-	handler, err := New(backend.URL)
+	proxyBackend, err := NewBackend(backend.URL)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -157,7 +157,16 @@ func TestApplicationStatusesDoNotCountAsCircuitBreakerFailures(t *testing.T) {
 		request := httptest.NewRequest(http.MethodGet, "/", nil)
 		request = request.WithContext(circuitbreaker.WithPermit(request.Context(), permit))
 		recorder := httptest.NewRecorder()
-		handler.ServeHTTP(recorder, request)
+		attemptHandler, ok := proxyBackend.Handler.(interface {
+			ServeAttemptResult(http.ResponseWriter, *http.Request) (*AttemptError, bool)
+		})
+		if !ok {
+			t.Fatal("proxy handler does not expose attempt result")
+		}
+		_, successful := attemptHandler.ServeAttemptResult(recorder, request)
+		if !successful {
+			t.Fatal("completed application response was marked as an unsuccessful upstream attempt")
+		}
 		if recorder.Code != status {
 			t.Errorf("application status = %d, want %d", recorder.Code, status)
 		}
@@ -483,6 +492,74 @@ func TestProxyReturnsBadGatewayWhenBackendIsUnavailable(t *testing.T) {
 
 	if recorder.Code != http.StatusBadGateway {
 		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusBadGateway)
+	}
+}
+
+func TestTransportFailureRecordedWithoutBreakerPermit(t *testing.T) {
+	outcome := &attemptOutcome{}
+	request := httptest.NewRequest(http.MethodGet, "http://backend.test", nil)
+	request = request.WithContext(context.WithValue(request.Context(), attemptOutcomeKey{}, outcome))
+	transport := breakerAwareTransport{next: roundTripperFunc(func(*http.Request) (*http.Response, error) { return nil, errors.New("dial failed") })}
+	if _, err := transport.RoundTrip(request); err == nil {
+		t.Fatal("RoundTrip error = nil, want transport failure")
+	}
+	if !outcome.failed.Load() {
+		t.Fatal("transport failure was not recorded without breaker permit")
+	}
+}
+
+func TestMeasuredAttemptReportsTTFBAndCompletedBody(t *testing.T) {
+	b, err := NewBackend("http://backend.test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := b.Handler.(*backendHandler)
+	handler.reverseProxy.Transport = breakerAwareTransport{next: roundTripperFunc(func(request *http.Request) (*http.Response, error) {
+		// Model a measurable upstream wait without sleeping or relying on local network scheduling.
+		started := time.Now()
+		for time.Since(started) < time.Millisecond {
+		}
+		return &http.Response{
+			StatusCode: http.StatusServiceUnavailable,
+			Status:     "503 Service Unavailable",
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader("body")),
+			Request:    request,
+		}, nil
+	})}
+	measured := b.Handler.(interface {
+		ServeMeasuredAttemptResult(http.ResponseWriter, *http.Request) MeasuredAttemptResult
+	})
+	recorder := httptest.NewRecorder()
+	result := measured.ServeMeasuredAttemptResult(recorder, httptest.NewRequest(http.MethodGet, "/", nil))
+	if result.Err != nil || !result.BodyCompleted || !result.TTFBAvailable || result.TTFB <= 0 || result.TransportFailure {
+		t.Fatalf("measured result = %+v, want completed 503 with available TTFB and no transport failure", result)
+	}
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("forwarded response status = %d, want 503", recorder.Code)
+	}
+}
+
+func TestCloseBeforeEOFDoesNotCreateSuccessOrBackendPenalty(t *testing.T) {
+	outcome := &attemptOutcome{}
+	body := observedResponseBody{ReadCloser: io.NopCloser(strings.NewReader("payload")), ctx: context.Background(), outcome: outcome}
+	if err := body.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if outcome.successful.Load() || outcome.failed.Load() {
+		t.Fatalf("close-before-EOF outcome = success %v failure %v, want neither", outcome.successful.Load(), outcome.failed.Load())
+	}
+}
+
+func TestCloseAfterEOFDoesNotInvalidateCompletion(t *testing.T) {
+	outcome := &attemptOutcome{}
+	body := observedResponseBody{ReadCloser: io.NopCloser(strings.NewReader("")), ctx: context.Background(), outcome: outcome}
+	_, _ = body.Read(make([]byte, 1))
+	if err := body.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if !outcome.successful.Load() || outcome.failed.Load() {
+		t.Fatalf("EOF outcome = success %v failure %v, want successful completion", outcome.successful.Load(), outcome.failed.Load())
 	}
 }
 

@@ -4,7 +4,7 @@
 
 IntelliGate is an API gateway and demonstration environment for routing traffic to an e-commerce application's Product, Order, and User services. The project is being built to explore secure client access, traffic management, service resilience, and observability in a modular microservices system.
 
-> **Phase 5B status:** The Go gateway and three FastAPI demonstration services are implemented. The gateway uses configurable per-service Round Robin pools, active health checks, upstream request timeouts, per-backend circuit breakers, bounded retries for eligible GET/HEAD transport failures, API-key authentication with role-based access control, and per-client-IP token-bucket rate limiting backed by either memory or Redis. Prometheus metrics and a provisioned Grafana overview dashboard are implemented. JWT/OAuth, distributed authentication, adaptive routing, persistence, application containerization, and anomaly detection remain planned.
+> **Phase 6 status:** The Go gateway and three FastAPI demonstration services are implemented. The gateway supports configurable Round Robin or adaptive backend routing, active health checks, upstream request timeouts, per-backend circuit breakers, bounded GET/HEAD retries, API-key authentication with RBAC, memory/Redis rate limiting, and Prometheus/Grafana observability. JWT/OAuth, distributed authentication, persistent application data, application containerization, and anomaly detection remain planned.
 
 ## Problem
 
@@ -14,7 +14,7 @@ Microservice applications need a consistent entry point to authenticate clients,
 
 - Establish a modular Go gateway foundation for future traffic management.
 - Simulate an e-commerce backend with Python and FastAPI services.
-- Compare Round Robin routing with an adaptive least-loaded strategy.
+- Compare Round Robin routing with adaptive latency/load-aware routing.
 - Plan security, resilience, observability, and reproducible performance evaluation.
 - Keep design and implementation status transparent throughout development.
 
@@ -34,8 +34,8 @@ Microservice applications need a consistent entry point to authenticate clients,
 | Gateway and service tests | Implemented in Phase 1 |
 | Shared/distributed rate limiting backed by Redis | Implemented in Phase 5A |
 | Round Robin baseline routing | Implemented in Phase 2A |
-| Adaptive least-loaded routing | Planned |
-| EWMA backend latency tracking | Planned |
+| Adaptive latency/load-aware routing | Implemented in Phase 6; opt-in |
+| Upstream TTFB EWMA and in-flight tracking | Implemented in Phase 6 |
 | Backend health monitoring and recovery | Implemented in Phase 2B |
 | Circuit breaker | Implemented in Phase 3B |
 | Controlled upstream retries | Implemented in Phase 3C |
@@ -53,7 +53,9 @@ Clients send service requests to the Go gateway on port 8080 by default; `INTELL
 
 Rate limiting is enabled by default. The `memory` store applies 10 tokens/second with a burst of 20 per client IP and is process-local. Set `INTELLIGATE_RATE_LIMIT_STORE=redis` to share buckets through Redis; configure its address, optional password, and database with `INTELLIGATE_REDIS_ADDR`, `INTELLIGATE_REDIS_PASSWORD`, and `INTELLIGATE_REDIS_DB`. Redis mode performs a bounded startup check and never silently falls back to memory. Failure mode is `closed` by default (HTTP 503 on Redis errors) or may be set to `open` (log a generic warning and allow the request). `GET /health` bypasses rate limiting in either mode. Client identity comes from the canonical IP parsed from `RemoteAddr`; forwarded-IP headers are not trusted. Idle state expires after 10 minutes; only memory mode runs a cleanup loop. A denied request receives HTTP 429 with a positive `Retry-After`.
 
-The gateway round-robins among configured instances that pass direct `/health` checks and have an available circuit-breaker permit. Breakers are per instance: after 5 qualifying transport failures, an instance is excluded for a 10-second cooldown before a half-open trial is allowed. A failed trial reopens it; the configured number of complete upstream responses closes it. Configure thresholds with the `INTELLIGATE_CIRCUIT_BREAKER_*` environment variables. A 5-second upstream timeout is the default (`INTELLIGATE_UPSTREAM_TIMEOUT` overrides it); GET and HEAD requests retry eligible pre-header transport failures up to twice, with 100ms and 200ms backoffs. The overall retry budget is `(3 × upstream timeout) + 300ms` (15.3 seconds by default). GET/HEAD bodies require `GetBody` for replay. Completed application responses and response-body streaming failures are not retried. Timeout before headers returns 504, exhausted ordinary proxy failures return 502, and no initially eligible backend returns 503. Gateway `GET /health` remains independent of backend state. The API listens on `:8080`; a separate metrics listener defaults to `:9091` and exposes Prometheus at `/metrics`, outside API authentication and rate limiting. Restrict its network access because it is unauthenticated. See [ARCHITECTURE.md](./ARCHITECTURE.md) for details.
+Backend selection defaults to health- and breaker-aware Round Robin. Set `INTELLIGATE_ROUTING_STRATEGY=adaptive` to opt in to adaptive routing. Adaptive ranking first prefers eligible backends outside their failure cooldown. If all eligible candidates are cooling down, it prefers the one that recovers earliest. During cold start, it explores the least-sampled eligible backend until every candidate in that retry pass has the configured number of successful samples; ties use the Round Robin cursor. Thereafter, it minimizes `EWMA upstream TTFB × (1 + in-flight requests)`, again using Round Robin tie-breaking. A transport failure starts a 5-second cooldown; consecutive failures increase it to 10, 20, then at most 30 seconds. A successful completed measured upstream response clears the failure count and cooldown. Retries use the same health- and breaker-aware selector and prefer an unattempted eligible backend before considering one already tried. Configure alpha with `INTELLIGATE_ADAPTIVE_EWMA_ALPHA` (default `0.2`, valid greater than 0 and at most 1) and the exploration threshold with `INTELLIGATE_ADAPTIVE_MIN_SAMPLES` (default `5`, positive integer). TTFB is captured when upstream response headers arrive, but contributes to EWMA and the successful-sample counter only after the response body completes successfully. Bodies remain streamed; in-flight accounting covers the attempt through body completion. Performance history is process-local and lost on restart; the score is a heuristic, not a global optimum guarantee.
+
+Breakers are per instance: after 5 qualifying transport failures, an instance is excluded for a 10-second cooldown before a half-open trial is allowed. A failed trial reopens it; the configured number of complete upstream responses closes it. Configure thresholds with the `INTELLIGATE_CIRCUIT_BREAKER_*` environment variables. A 5-second upstream timeout is the default (`INTELLIGATE_UPSTREAM_TIMEOUT` overrides it); GET and HEAD requests retry eligible pre-header transport failures up to twice, with 100ms and 200ms backoffs. The overall retry budget is `(3 × upstream timeout) + 300ms` (15.3 seconds by default). GET/HEAD bodies require `GetBody` for replay. Completed application responses and response-body streaming failures are not retried. Timeout before headers returns 504, exhausted ordinary proxy failures return 502, and no initially eligible backend returns 503. Gateway `GET /health` remains independent of backend state. The API listens on `:8080`; a separate metrics listener defaults to `:9091` and exposes Prometheus at `/metrics`, outside API authentication and rate limiting. Restrict its network access because it is unauthenticated. See [ARCHITECTURE.md](./ARCHITECTURE.md) for details.
 
 ## Technology stack
 
@@ -132,10 +134,11 @@ The `observability/` Compose stack runs only Prometheus and Grafana; the gateway
 | 4B.2 | Add role-based access control for API keys | Implemented; tests included |
 | 5A | Add optional Redis-backed shared token-bucket rate limiting | Implemented; tests included |
 | 5B | Add Prometheus metrics and provisioned Grafana monitoring | Implemented; tests included |
-| Later | Add JWT/OAuth, distributed authentication, and adaptive routing | Pending |
+| 6 | Add opt-in adaptive EWMA/load-aware backend routing | Implemented; tests included |
+| Later | Add JWT/OAuth and distributed authentication | Pending |
 | Later | Add dashboard, anomaly detection, load experiments, and deployment automation | Pending |
 
-Phase 1, Phase 2A, Phase 2B, Phase 3A, Phase 3B, Phase 3C, Phase 4A, Phase 4B.1, Phase 4B.2, Phase 5A, and Phase 5B implementations are recorded below. Later-phase work remains pending.
+Phase 1, Phase 2A, Phase 2B, Phase 3A, Phase 3B, Phase 3C, Phase 4A, Phase 4B.1, Phase 4B.2, Phase 5A, Phase 5B, and Phase 6 implementations are recorded below. Later-phase work remains pending.
 
 ## Run locally
 
@@ -153,11 +156,14 @@ Repeat in separate terminals for Order (`services\order-service`, port `8002`) a
 ```powershell
 $env:PRODUCT_SERVICE_URLS = "http://localhost:8001,http://localhost:8011"
 $env:INTELLIGATE_API_KEYS = "local-placeholder-key-one,local-placeholder-key-two"
+$env:INTELLIGATE_ROUTING_STRATEGY = "adaptive"
+$env:INTELLIGATE_ADAPTIVE_EWMA_ALPHA = "0.2"
+$env:INTELLIGATE_ADAPTIVE_MIN_SAMPLES = "5"
 Set-Location gateway
 go run .\cmd\gateway
 ```
 
-The supported variables are `PRODUCT_SERVICE_URLS`, `ORDER_SERVICE_URLS`, and `USER_SERVICE_URLS`; each defaults to its existing localhost port when unset. The example secondary port is illustrative and not reserved by the project.
+The supported variables are `PRODUCT_SERVICE_URLS`, `ORDER_SERVICE_URLS`, and `USER_SERVICE_URLS`; each defaults to its existing localhost port when unset. The example secondary port is illustrative and not reserved by the project. `INTELLIGATE_ROUTING_STRATEGY` accepts `round_robin` (default) or `adaptive`; `INTELLIGATE_ADAPTIVE_EWMA_ALPHA` defaults to `0.2` and accepts finite values greater than 0 through 1; `INTELLIGATE_ADAPTIVE_MIN_SAMPLES` defaults to `5` and must be a positive integer. All three are validated at startup. Round Robin remains the default unless adaptive is explicitly selected.
 
 The gateway listens on `http://localhost:8080`. The placeholder keys above are for local testing only; use protected secret management for real keys and never commit them. API routes require the `X-API-Key` header, for example:
 
@@ -222,10 +228,10 @@ go run .\cmd\gateway
 
 Prometheus scrapes `host.docker.internal:9091` every five seconds; open Prometheus at `http://localhost:9090` and Grafana at `http://localhost:3000`. Sign in with the credentials set in the shell that starts Compose; the IntelliGate Overview dashboard is provisioned automatically. Metrics are not API-authenticated, so restrict access to port 9091 using host firewall/network controls. Stop the monitoring containers with `docker compose -f observability\docker-compose.yml down`; named data volumes are retained.
 
-The custom metric families cover `intelligate_http_requests_total`, `intelligate_http_request_duration_seconds`, `intelligate_rate_limit_rejections_total`, `intelligate_security_denials_total`, `intelligate_backend_health`, `intelligate_backend_health_transitions_total`, `intelligate_backend_selections_total`, `intelligate_backend_selection_failures_total`, `intelligate_circuit_breaker_state`, `intelligate_circuit_breaker_transitions_total`, `intelligate_upstream_retry_attempts_total`, and `intelligate_upstream_retry_outcomes_total`. Labels use normalized methods/routes, status/reason/stage/state/outcome, service, and stable backend IDs only; raw URLs, IPs, API keys, and arbitrary errors are never labels. See [API_DOCUMENTATION.md](./API_DOCUMENTATION.md) for types and label sets.
+The custom metric families cover `intelligate_http_requests_total`, `intelligate_http_request_duration_seconds`, `intelligate_rate_limit_rejections_total`, `intelligate_security_denials_total`, `intelligate_backend_health`, `intelligate_backend_health_transitions_total`, `intelligate_backend_selections_total`, `intelligate_backend_selection_failures_total`, `intelligate_circuit_breaker_state`, `intelligate_circuit_breaker_transitions_total`, `intelligate_upstream_retry_attempts_total`, `intelligate_upstream_retry_outcomes_total`, and adaptive `intelligate_backend_ewma_latency_seconds`, `intelligate_backend_in_flight_requests`, and `intelligate_backend_successful_samples_total`. Labels use normalized methods/routes, status/reason/stage/state/outcome, service, and stable backend IDs only; raw URLs, IPs, API keys, and arbitrary errors are never labels. See [API_DOCUMENTATION.md](./API_DOCUMENTATION.md) for types and label sets.
 
 ## Current implementation status
 
-- **Implemented:** Phase 1 Go reverse proxy and three FastAPI services; Phase 2A per-service Round Robin; Phase 2B health checks and health-aware selection; Phase 3A configurable upstream request timeout; Phase 3B per-backend circuit breakers; Phase 3C bounded controlled retries; Phase 4A in-memory per-client-IP token bucket; Phase 4B.1 API-key authentication; Phase 4B.2 role-based access control; Phase 5A optional Redis-backed shared token buckets; Phase 5B Prometheus instrumentation and Grafana monitoring stack.
-- **Not implemented:** JWT/OAuth, distributed authentication, adaptive routing, database integration, application containerization, load tests, and CI/CD workflows.
+- **Implemented:** Phase 1 Go reverse proxy and three FastAPI services; Phase 2A per-service Round Robin; Phase 2B health checks and health-aware selection; Phase 3A configurable upstream request timeout; Phase 3B per-backend circuit breakers; Phase 3C bounded controlled retries; Phase 4A in-memory per-client-IP token bucket; Phase 4B.1 API-key authentication; Phase 4B.2 role-based access control; Phase 5A optional Redis-backed shared token buckets; Phase 5B Prometheus instrumentation and Grafana monitoring stack; Phase 6 opt-in adaptive backend routing.
+- **Not implemented:** JWT/OAuth, distributed authentication, database integration, application containerization, load tests, and CI/CD workflows.
 - **Verification:** Current test and manual integration procedures are recorded in [TESTING.md](./TESTING.md); actual run results are recorded in [DEVELOPMENT_LOG.md](./DEVELOPMENT_LOG.md).

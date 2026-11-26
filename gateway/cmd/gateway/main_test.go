@@ -19,6 +19,7 @@ import (
 	dto "github.com/prometheus/client_model/go"
 
 	"intelligate/gateway/internal/auth"
+	"intelligate/gateway/internal/balancer"
 	"intelligate/gateway/internal/circuitbreaker"
 	"intelligate/gateway/internal/health"
 	"intelligate/gateway/internal/observability"
@@ -477,6 +478,61 @@ func TestMetricsListenAddressFromEnvDefaultsAndValidates(t *testing.T) {
 	}
 }
 
+func TestRoutingConfigFromEnvDefaultsAndAcceptsAdaptiveOverrides(t *testing.T) {
+	unsetEnvironment(t, routingStrategyEnv, adaptiveEWMAAlphaEnv, adaptiveMinSamplesEnv)
+	config, err := routingConfigFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := balancer.DefaultRoutingConfig(); config != want {
+		t.Fatalf("default routing config = %+v, want %+v", config, want)
+	}
+
+	t.Setenv(routingStrategyEnv, "adaptive")
+	t.Setenv(adaptiveEWMAAlphaEnv, "0.35")
+	t.Setenv(adaptiveMinSamplesEnv, "8")
+	config, err = routingConfigFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := balancer.RoutingConfig{
+		Strategy:   balancer.StrategyAdaptive,
+		EWMAAlpha:  0.35,
+		MinSamples: 8,
+	}
+	if config != want {
+		t.Fatalf("adaptive routing config = %+v, want %+v", config, want)
+	}
+}
+
+func TestRoutingConfigFromEnvRejectsInvalidValues(t *testing.T) {
+	tests := []struct {
+		name    string
+		envName string
+		value   string
+	}{
+		{name: "unknown strategy", envName: routingStrategyEnv, value: "least_loaded"},
+		{name: "empty strategy", envName: routingStrategyEnv, value: ""},
+		{name: "invalid alpha", envName: adaptiveEWMAAlphaEnv, value: "invalid"},
+		{name: "zero alpha", envName: adaptiveEWMAAlphaEnv, value: "0"},
+		{name: "alpha above one", envName: adaptiveEWMAAlphaEnv, value: "1.01"},
+		{name: "NaN alpha", envName: adaptiveEWMAAlphaEnv, value: "NaN"},
+		{name: "infinite alpha", envName: adaptiveEWMAAlphaEnv, value: "+Inf"},
+		{name: "invalid minimum samples", envName: adaptiveMinSamplesEnv, value: "many"},
+		{name: "zero minimum samples", envName: adaptiveMinSamplesEnv, value: "0"},
+		{name: "negative minimum samples", envName: adaptiveMinSamplesEnv, value: "-1"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			unsetEnvironment(t, routingStrategyEnv, adaptiveEWMAAlphaEnv, adaptiveMinSamplesEnv)
+			t.Setenv(test.envName, test.value)
+			if _, err := routingConfigFromEnv(); err == nil || !strings.Contains(err.Error(), test.envName) {
+				t.Fatalf("routingConfigFromEnv() error = %v, want clear %s validation error", err, test.envName)
+			}
+		})
+	}
+}
+
 func TestRateLimitSettingsFromEnvAcceptsOverrides(t *testing.T) {
 	unsetEnvironment(t, rateLimitStoreEnv, redisAddrEnv, redisPasswordEnv, redisDBEnv, rateLimitRedisFailureModeEnv)
 	t.Setenv(rateLimitEnabledEnv, "true")
@@ -807,6 +863,10 @@ func TestConfiguredBackendMetricsFollowHealthSelectionAndBreakerEvents(t *testin
 	}
 	assertMetricValue(t, metrics, "intelligate_backend_selections_total",
 		map[string]string{"service": "products", "backend_id": "products-1", "attempt": "initial"}, 1)
+	assertMetricValue(t, metrics, "intelligate_backend_successful_samples_total",
+		map[string]string{"service": "products", "backend_id": "products-1"}, 1)
+	assertMetricValue(t, metrics, "intelligate_backend_in_flight_requests",
+		map[string]string{"service": "products", "backend_id": "products-1"}, 0)
 
 	backend.Close()
 	postRecorder := httptest.NewRecorder()
@@ -814,6 +874,8 @@ func TestConfiguredBackendMetricsFollowHealthSelectionAndBreakerEvents(t *testin
 	if postRecorder.Code != http.StatusBadGateway {
 		t.Fatalf("unreachable backend response = %d, want 502", postRecorder.Code)
 	}
+	assertMetricValue(t, metrics, "intelligate_backend_successful_samples_total",
+		map[string]string{"service": "products", "backend_id": "products-1"}, 1)
 	assertMetricValue(t, metrics, "intelligate_circuit_breaker_state",
 		map[string]string{"service": "products", "backend_id": "products-1", "state": "open"}, 1)
 	assertMetricValue(t, metrics, "intelligate_circuit_breaker_state",

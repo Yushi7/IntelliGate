@@ -1,10 +1,10 @@
 # IntelliGate Proposed Architecture
 
-**Status:** Phase 1 implements the Go HTTP reverse proxy and three FastAPI services. Phase 2A adds per-service Round Robin pools; Phase 2B adds active health probes and selects only healthy instances; Phase 3A adds configurable upstream request timeouts; Phase 3B adds per-backend circuit breakers; Phase 3C adds bounded retries for eligible upstream transport failures; Phase 4A adds an in-memory per-client-IP token bucket; Phase 4B.1 adds API-key authentication; Phase 4B.2 adds role-based access control; Phase 5A adds optional Redis-backed shared token buckets; Phase 5B adds Prometheus instrumentation and a provisioned Grafana dashboard. JWT/OAuth, distributed authentication, adaptive routing, databases, and application containerization remain proposed.
+**Status:** Phase 1 implements the Go HTTP reverse proxy and three FastAPI services. Phase 2A adds per-service Round Robin pools; Phase 2B adds active health probes and selects only healthy instances; Phase 3A adds configurable upstream request timeouts; Phase 3B adds per-backend circuit breakers; Phase 3C adds bounded retries for eligible upstream transport failures; Phase 4A adds an in-memory per-client-IP token bucket; Phase 4B.1 adds API-key authentication; Phase 4B.2 adds role-based access control; Phase 5A adds optional Redis-backed shared token buckets; Phase 5B adds Prometheus instrumentation and a provisioned Grafana dashboard; Phase 6 adds opt-in adaptive routing. JWT/OAuth, distributed authentication, databases, and application containerization remain proposed.
 
 ## 1. High-level system architecture
 
-The Go gateway is the public entry point for client API traffic. It proxies requests to configured Python FastAPI backend instances using Go's standard HTTP reverse-proxy capabilities and selects an instance round-robin from each service's healthy pool. Direct backend `/health` probes update eligibility. A separate metrics listener exposes bounded-cardinality Prometheus metrics; Prometheus and Grafana run in the optional `observability/` Compose stack while the gateway initially runs natively. Redis is implemented as an optional shared rate-limit store; PostgreSQL is designated for persistent application data and selected configuration. Locust, the application dashboard, and anomaly-detection component remain planned.
+The Go gateway is the public entry point for client API traffic. It proxies requests to configured Python FastAPI backend instances using Go's standard HTTP reverse-proxy capabilities and selects an instance using health- and breaker-aware Round Robin by default, or adaptive latency/load scoring when configured. Direct backend `/health` probes update eligibility. A separate metrics listener exposes bounded-cardinality Prometheus metrics; Prometheus and Grafana run in the optional `observability/` Compose stack while the gateway initially runs natively. Redis is implemented as an optional shared rate-limit store; PostgreSQL is designated for persistent application data and selected configuration. Locust, the application dashboard, and anomaly-detection component remain planned.
 
 ```mermaid
 flowchart LR
@@ -64,7 +64,7 @@ Beyond the Phase 1 behavior below, the gateway is responsible for:
 - Select a configured backend instance round-robin within each service pool (implemented in Phase 2A).
 - Probe backend health and select only healthy instances (implemented in Phase 2B).
 - Admit only healthy instances whose circuit breaker permits a request (implemented in Phase 3B).
-- Select instances using an adaptive policy (planned; not implemented).
+- Select instances using adaptive EWMA latency/load scoring (implemented in Phase 6; opt-in).
 - Bound upstream proxy requests using the configured timeout (implemented in Phase 3A); preserve 502 for ordinary proxy failures and return 504 when an upstream deadline expires before response headers.
 - Gather HTTP request/status/duration, security-denial, rate-limit, backend-health/selection, breaker, and retry metrics (implemented in Phase 5B).
 - Expose gateway `GET /health` and separate-listener Prometheus `GET /metrics` (implemented); readiness remains planned.
@@ -110,7 +110,7 @@ Separately, the health checker probes every configured instance directly at `/he
 
 The independent metrics listener serves `/metrics` from a dedicated Prometheus registry. It is not routed through the API handler or counted as a public API request. It exposes Go/process runtime collectors alongside IntelliGate metrics.
 
-Adaptive backend selection remains proposed. Instrumentation callbacks are bounded and non-sensitive; callbacks that could run near component locks are invoked after releasing those locks, and metrics do not affect routing outcomes.
+Adaptive backend selection is implemented as an opt-in policy. Instrumentation callbacks are bounded and non-sensitive; metrics do not affect routing outcomes.
 
 The gateway applies the controlled retry policy described below after backend selection. It does not infer failures from downstream HTTP status codes.
 
@@ -152,7 +152,7 @@ sequenceDiagram
     P->>G: Scrape metrics endpoint
 ```
 
-The metrics scrape is handled by the separate listener and does not pass through the API handler chain shown above. The request lifecycle and all depicted gateway-to-service interactions are implemented, except for future adaptive routing.
+The metrics scrape is handled by the separate listener and does not pass through the API handler chain shown above. The depicted gateway-to-service lifecycle supports both the default Round Robin selector and the opt-in adaptive selector.
 
 ## 4. API key authentication and role authorization (implemented in Phases 4B.1/4B.2)
 
@@ -192,17 +192,31 @@ Use the same Redis address, database, rate, and burst configuration for every ga
 
 ## 6. Routing and load balancing
 
-### Health-aware Round Robin (implemented in Phase 2B)
+### Health-aware routing (Round Robin default; adaptive option implemented in Phase 6)
 
-Each service has its own selector over its configured backend handler list and health flags. For each request, the selector locks briefly, scans from its cursor for the next healthy instance, advances after that selection, and unlocks before proxying. Health updates use the same mutex. If no instance is healthy, it returns `503 Service Unavailable`. The selector preserves the Phase 2A all-healthy constructor default; gateway initialization explicitly sets every instance unhealthy before probing.
+Each service has its own selector over its configured backend handler list, health flags, breakers, and performance state. `INTELLIGATE_ROUTING_STRATEGY` selects `round_robin` (default) or `adaptive`; the strategy is configured consistently for Product, Order, and User. Both policies preserve health and circuit-breaker admission and return `503 Service Unavailable` when no backend is eligible. The selector preserves the Phase 2A all-healthy constructor default; gateway initialization explicitly sets every instance unhealthy before probing.
 
 The health checker sends direct GET requests to each backend's `/health` endpoint. It runs the initial probes concurrently before the HTTP server starts, then probes periodically every 5 seconds with a 2-second client timeout. Only 2xx responses are healthy; redirects are not followed. Connection failures, timeouts, and other status codes mark an instance unhealthy. The next successful probe restores it to the round-robin pool. Health is based only on probe outcomes, not ordinary application responses.
 
-If a backend fails after its last successful probe, eligible GET/HEAD requests may retry a bounded number of times through the same health- and breaker-aware selector. Other methods and completed upstream responses are not retried. Repeated qualifying failures open that backend's breaker; it is then excluded independently of health state. If no backend is eligible before the initial attempt, the route returns 503; after a retryable failure, exhaustion or lack of an eligible next backend returns the last gateway-observed 502/504. Gateway `GET /health` remains a process liveness check and returns 200 regardless of backend health or breaker state.
+If a backend fails after its last successful probe, eligible GET/HEAD requests may retry a bounded number of times through the same health- and breaker-aware selector. Other methods and completed upstream responses are not retried. Repeated qualifying failures open that backend's breaker; it is then excluded independently of health state. If no backend is eligible before the initial attempt, the route returns 503; after a retryable failure, exhaustion or lack of an eligible next backend returns the last gateway-observed 502/504. Gateway `GET /health` remains a process liveness check and returns 200 regardless of backend health or breaker state. `round_robin` retains its existing cursor behavior unchanged.
 
-### Adaptive Least-Loaded
+### Adaptive latency/load routing
 
-The adaptive policy will select an eligible instance using a measured load signal rather than fixed rotation. It should account for current in-flight requests and latency signals, while ensuring stale latency measurements do not unfairly penalize a backend indefinitely. The actual scoring formula, coefficients, and tie-breaking policy remain open implementation decisions for a later phase. Measurements must be collected consistently to avoid giving either policy an unfair advantage.
+The adaptive selector tracks each measured backend attempt, including retries, without holding the selector mutex during handler execution. It increments in-flight state before dispatch and decrements it when the complete attempt finishes, including response-body streaming. Response bodies are streamed without buffering. TTFB is measured from the upstream `RoundTrip` dispatch until response headers arrive. The TTFB is pending until the upstream response body completes successfully; only then is it added as a successful EWMA sample. A missing TTFB measurement, incomplete body, gateway attempt error, or client cancellation does not produce a sample. Complete HTTP 4xx and 5xx responses count as successful transport responses.
+
+Successful TTFB samples are exponentially weighted per backend with:
+
+`EWMA_new = EWMA_old + alpha × (sample_latency - EWMA_old)`
+
+The first successful sample initializes EWMA directly. This follows the proxy/breaker transport-success definition: any complete upstream HTTP response, including an application 4xx/5xx, is a successful latency sample; gateway-generated transport failures, timeouts, incomplete body reads, and cancellations are not.
+
+Configure `INTELLIGATE_ROUTING_STRATEGY` (`round_robin` by default, or `adaptive`), `INTELLIGATE_ADAPTIVE_EWMA_ALPHA` (default `0.2`, finite and valid `(0, 1]`), and `INTELLIGATE_ADAPTIVE_MIN_SAMPLES` (default `5`, positive integer). Invalid values prevent startup. Within each selector pass, cooldown status is ranked first: prefer eligible backends outside cooldown; if all candidates are cooling down, prefer earliest recovery. Among non-cooling candidates, until every currently eligible backend in that pass has reached the minimum successful sample count, selection prefers the eligible backend with the fewest samples. Ties rotate deterministically using the existing Round Robin cursor. Once all candidates meet the threshold, select the lowest score:
+
+`score = EWMA latency × (1 + current in-flight requests)`
+
+Equal scores use deterministic Round Robin tie-breaking. Retry selection first considers eligible backends not yet attempted in the current request; cooldown ranking is applied within that group before previously attempted candidates are considered. Health and breaker admission still apply; an open breaker or a saturated half-open breaker is skipped. Each consecutive upstream transport/body failure increases a per-process cooldown from 5 seconds to 10, then 20, capped at 30 seconds. A successful completed measured response clears the failure count and cooldown. Client cancellations and downstream disconnects do not penalize a backend.
+
+Performance history is held in memory per gateway process and is lost at restart. Separate gateway instances do not share these estimates; adaptive selection is local to each process. The score is a simple heuristic, not a guarantee of globally optimal routing. A backend with no successful observations remains in exploration, and adaptive mode has no explicit sample-age decay.
 
 ```mermaid
 flowchart TD
@@ -212,9 +226,9 @@ flowchart TD
     Health -->|Yes| Admission[Exclude OPEN breakers; reserve HALF-OPEN trial permits]
     Admission -->|No eligible backends| Fail
     Admission -->|Eligible backends| Policy{Selected policy}
-    Policy -->|Round Robin implemented| RR[Advance per-service cursor]
+    Policy -->|Round Robin default| RR[Advance per-service cursor]
     RR --> RRChoice[Choose next healthy instance]
-    Policy -->|Adaptive Least-Loaded planned| Filter[Filter unhealthy and OPEN instances]
+    Policy -->|Adaptive opt-in| Filter[Filter unhealthy and breaker-rejected instances]
     Filter --> Empty{Any eligible instances?}
     Empty -->|No| Fail
     Empty -->|Yes| Signals[Read current load and EWMA signals]
@@ -230,15 +244,11 @@ flowchart TD
     Retry --> Proxy
 ```
 
-The diagram shows active-health and breaker admission with the implemented Round Robin policy and a proposed adaptive policy. Adaptive scoring is not implemented.
+The diagram shows active-health and breaker admission shared by the default Round Robin policy and the opt-in adaptive policy.
 
-## 7. EWMA latency tracking
+## 7. Adaptive routing metrics
 
-The gateway is planned to maintain a per-instance exponentially weighted moving average of observed response latency. With a chosen smoothing factor `alpha` (where `0 < alpha <= 1`), a sample update is:
-
-`EWMA_new = alpha * latency_sample + (1 - alpha) * EWMA_previous`
-
-The initialization rule, alpha, treatment of timeouts/errors, observation window, and concurrency safety need to be specified and measured. EWMA is a routing signal, not a substitute for health state or a guarantee of future latency.
+Phase 6 adds `intelligate_backend_ewma_latency_seconds` (gauge), `intelligate_backend_in_flight_requests` (gauge), and `intelligate_backend_successful_samples_total` (counter), each labeled only by the existing bounded `service` and stable `backend_id`. These values describe one gateway process and initialize to zero for each configured backend. They do not expose URLs, client identities, or arbitrary request data.
 
 ## 8. Health monitoring and recovery (implemented in Phase 2B)
 
@@ -285,6 +295,9 @@ The custom metrics and labels are:
 | `intelligate_circuit_breaker_transitions_total` | Counter | `service`, `backend_id`, `from`, `to` |
 | `intelligate_upstream_retry_attempts_total` | Counter | `service`, `method` |
 | `intelligate_upstream_retry_outcomes_total` | Counter | `service`, `outcome` (`response`, `transport_error`, `cancelled`, `exhausted`) |
+| `intelligate_backend_ewma_latency_seconds` | Gauge | `service`, `backend_id` |
+| `intelligate_backend_in_flight_requests` | Gauge | `service`, `backend_id` |
+| `intelligate_backend_successful_samples_total` | Counter | `service`, `backend_id` |
 
 Methods are normalized to known HTTP methods or `OTHER`; routes are normalized to `products`, `orders`, `users`, `health`, or `unmatched`. Backend IDs are stable service-and-index identifiers, never target URLs. HTTP status remains a numeric status label. Raw paths, query strings, client IPs, API keys, role names, and arbitrary errors are not labels. Request metrics count one incoming API request regardless of internal upstream attempts and capture the final gateway status, including 401, 403, 429, 502, 503, and 504. Histograms start at millisecond-scale buckets and extend based on the configured retry budget. Health and one-hot breaker gauges are initialized for configured backends; transition counters count each state-transition notification while generation guards prevent stale gauge writes.
 
@@ -306,6 +319,6 @@ A Python component using scikit-learn is planned to explore anomalies in aggrega
 
 ## 12. Architectural decisions and open decisions
 
-**Fixed decisions:** Go gateway; standard-library reverse-proxy capabilities; FastAPI services; per-service Round Robin across configured backend URLs; independent health and circuit-breaker state per backend; Redis-backed distributed rate-limit state; PostgreSQL for persistent records/configuration; Prometheus and Grafana; Locust; future comparison with Adaptive Least-Loaded.
+**Fixed decisions:** Go gateway; standard-library reverse-proxy capabilities; FastAPI services; per-service Round Robin default with opt-in adaptive routing; independent health, performance, and circuit-breaker state per backend; Redis-backed distributed rate-limit state; PostgreSQL for persistent records/configuration; Prometheus and Grafana; Locust.
 
-**Open decisions:** Additional local backend port assignments; runtime pool reload; health flapping/hysteresis policy; routing score and EWMA parameters; auth key lifecycle and admin authorization; dashboard interaction; anomaly model and operation mode. Metrics are currently process-local observations; multi-gateway metric aggregation depends on Prometheus scraping each instance separately.
+**Open decisions:** Additional local backend port assignments; runtime pool reload; health flapping/hysteresis policy; future routing-policy changes beyond the implemented score and configurable EWMA parameters; auth key lifecycle and admin authorization; dashboard interaction; anomaly model and operation mode. Metrics and adaptive performance estimates are process-local observations; multi-gateway metric aggregation depends on Prometheus scraping each instance separately.

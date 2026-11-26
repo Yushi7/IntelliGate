@@ -58,6 +58,9 @@ func TestMetricsRegisterExpectedFamilies(t *testing.T) {
 		"intelligate_circuit_breaker_transitions_total",
 		"intelligate_upstream_retry_attempts_total",
 		"intelligate_upstream_retry_outcomes_total",
+		"intelligate_backend_ewma_latency_seconds",
+		"intelligate_backend_in_flight_requests",
+		"intelligate_backend_successful_samples_total",
 		"go_goroutines",
 	} {
 		if !found[name] {
@@ -66,6 +69,40 @@ func TestMetricsRegisterExpectedFamilies(t *testing.T) {
 	}
 	if metrics.Registry() == prometheus.DefaultRegisterer {
 		t.Fatal("metrics registry unexpectedly uses Prometheus's global default registry")
+	}
+}
+
+func TestAdaptivePerformanceMetricsUseStableBackendLabelsAndOrderedSnapshots(t *testing.T) {
+	metrics := observability.New(time.Second)
+	metrics.InitializeBackend("products", "products-2")
+	metrics.SetBackendPerformance("products", "products-2", 250*time.Millisecond, 1, false, 1)
+	metrics.SetBackendPerformance("products", "products-2", 250*time.Millisecond, 0, true, 2)
+	metrics.SetBackendPerformance("products", "products-2", 10*time.Second, 9, false, 1)
+
+	if got := gaugeValue(t, metrics.Registry(), "intelligate_backend_ewma_latency_seconds",
+		map[string]string{"service": "products", "backend_id": "products-2"}); got != 0.25 {
+		t.Fatalf("backend EWMA metric = %v, want 0.25 seconds", got)
+	}
+	if got := gaugeValue(t, metrics.Registry(), "intelligate_backend_in_flight_requests",
+		map[string]string{"service": "products", "backend_id": "products-2"}); got != 0 {
+		t.Fatalf("backend in-flight metric = %v, want 0", got)
+	}
+	if got := counterValue(t, metrics.Registry(), "intelligate_backend_successful_samples_total",
+		map[string]string{"service": "products", "backend_id": "products-2"}); got != 1 {
+		t.Fatalf("successful sample metric = %v, want 1", got)
+	}
+	families, err := metrics.Registry().Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, family := range families {
+		for _, metric := range family.GetMetric() {
+			for _, label := range metric.GetLabel() {
+				if label.GetName() == "backend_id" && label.GetValue() != "products-2" {
+					t.Errorf("adaptive metric used unexpected backend ID label %q", label.GetValue())
+				}
+			}
+		}
 	}
 }
 

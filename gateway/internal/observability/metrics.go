@@ -15,22 +15,27 @@ import (
 type Metrics struct {
 	registry *prometheus.Registry
 
-	httpRequests           *prometheus.CounterVec
-	httpRequestDuration    *prometheus.HistogramVec
-	rateLimitRejections    *prometheus.CounterVec
-	securityDenials        *prometheus.CounterVec
-	backendHealth          *prometheus.GaugeVec
-	backendHealthChanges   *prometheus.CounterVec
-	backendSelections      *prometheus.CounterVec
-	selectionFailures      *prometheus.CounterVec
-	breakerStates          *prometheus.GaugeVec
-	breakerTransitions     *prometheus.CounterVec
-	retryAttempts          *prometheus.CounterVec
-	retryOutcomes          *prometheus.CounterVec
-	backendHealthMu        sync.Mutex
-	backendHealthVersion   map[string]uint64
-	breakerStateMu         sync.Mutex
-	breakerStateGeneration map[string]uint64
+	httpRequests                 *prometheus.CounterVec
+	httpRequestDuration          *prometheus.HistogramVec
+	rateLimitRejections          *prometheus.CounterVec
+	securityDenials              *prometheus.CounterVec
+	backendHealth                *prometheus.GaugeVec
+	backendHealthChanges         *prometheus.CounterVec
+	backendSelections            *prometheus.CounterVec
+	selectionFailures            *prometheus.CounterVec
+	breakerStates                *prometheus.GaugeVec
+	breakerTransitions           *prometheus.CounterVec
+	retryAttempts                *prometheus.CounterVec
+	retryOutcomes                *prometheus.CounterVec
+	backendEWMALatency           *prometheus.GaugeVec
+	backendInFlight              *prometheus.GaugeVec
+	backendSuccessfulSamples     *prometheus.CounterVec
+	backendHealthMu              sync.Mutex
+	backendHealthVersion         map[string]uint64
+	backendPerformanceMu         sync.Mutex
+	backendPerformanceGeneration map[string]uint64
+	breakerStateMu               sync.Mutex
+	breakerStateGeneration       map[string]uint64
 }
 
 func New(upstreamTimeout time.Duration) *Metrics {
@@ -86,8 +91,21 @@ func New(upstreamTimeout time.Duration) *Metrics {
 			Name: "intelligate_upstream_retry_outcomes_total",
 			Help: "Outcomes for dispatched upstream retry attempts.",
 		}, []string{"service", "outcome"}),
-		backendHealthVersion:   make(map[string]uint64),
-		breakerStateGeneration: make(map[string]uint64),
+		backendEWMALatency: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "intelligate_backend_ewma_latency_seconds",
+			Help: "Estimated successful upstream response latency for each backend.",
+		}, []string{"service", "backend_id"}),
+		backendInFlight: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "intelligate_backend_in_flight_requests",
+			Help: "Number of requests currently executing on each backend.",
+		}, []string{"service", "backend_id"}),
+		backendSuccessfulSamples: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "intelligate_backend_successful_samples_total",
+			Help: "Successful backend latency samples observed by this gateway process.",
+		}, []string{"service", "backend_id"}),
+		backendHealthVersion:         make(map[string]uint64),
+		backendPerformanceGeneration: make(map[string]uint64),
+		breakerStateGeneration:       make(map[string]uint64),
 	}
 
 	registry.MustRegister(
@@ -105,6 +123,9 @@ func New(upstreamTimeout time.Duration) *Metrics {
 		metrics.breakerTransitions,
 		metrics.retryAttempts,
 		metrics.retryOutcomes,
+		metrics.backendEWMALatency,
+		metrics.backendInFlight,
+		metrics.backendSuccessfulSamples,
 	)
 	return metrics
 }
@@ -192,6 +213,13 @@ func (m *Metrics) InitializeBackend(service, backendID string) {
 	m.backendHealth.WithLabelValues(service, backendID).Set(0)
 	m.backendHealthMu.Unlock()
 
+	m.backendPerformanceMu.Lock()
+	m.backendPerformanceGeneration[backendKey(service, backendID)] = 0
+	m.backendEWMALatency.WithLabelValues(service, backendID).Set(0)
+	m.backendInFlight.WithLabelValues(service, backendID).Set(0)
+	m.backendSuccessfulSamples.WithLabelValues(service, backendID)
+	m.backendPerformanceMu.Unlock()
+
 	m.breakerStateMu.Lock()
 	m.breakerStateGeneration[backendKey(service, backendID)] = 0
 	for _, state := range []string{"closed", "open", "half_open"} {
@@ -269,6 +297,23 @@ func (m *Metrics) RecordRetryOutcome(service, outcome string) {
 		return
 	}
 	m.retryOutcomes.WithLabelValues(service, outcome).Inc()
+}
+
+func (m *Metrics) SetBackendPerformance(service, backendID string, ewma time.Duration, inFlight uint64, sampleAdded bool, generation uint64) {
+	if !validService(service) || !validBackendID(backendID) {
+		return
+	}
+	key := backendKey(service, backendID)
+	m.backendPerformanceMu.Lock()
+	if sampleAdded {
+		m.backendSuccessfulSamples.WithLabelValues(service, backendID).Inc()
+	}
+	if generation > m.backendPerformanceGeneration[key] {
+		m.backendPerformanceGeneration[key] = generation
+		m.backendEWMALatency.WithLabelValues(service, backendID).Set(ewma.Seconds())
+		m.backendInFlight.WithLabelValues(service, backendID).Set(float64(inFlight))
+	}
+	m.backendPerformanceMu.Unlock()
 }
 
 func validService(service string) bool {
